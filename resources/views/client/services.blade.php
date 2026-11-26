@@ -379,18 +379,16 @@
                         'icon' => $sub->icon ?? 'bi-check-circle',
                     ])->toJson();
 
-                    $hasCustomImage = !empty($service->image_url) && (
-                        file_exists(public_path($service->image_url)) ||
-                        str_starts_with($service->image_url, 'http')
-                    );
+                    $hasCustomImage = !empty($service->image_url) && \App\Helpers\StorageHelper::exists($service->image_url);
+                    $serviceImageUrl = $hasCustomImage ? \App\Helpers\StorageHelper::url($service->image_url) : null;
                 @endphp
                 <div class="col-12 col-sm-6 col-lg-4 col-xl-3 service-card-container" data-category="{{ $categoryKey }}" data-name="{{ $searchableName }}">
                     <div class="card service-catalog-card h-100 d-flex flex-column position-relative overflow-hidden">
 
                         <!-- Image Banner with Fallback to Stylized Gradient Icon -->
-                        @if($hasCustomImage)
+                        @if($hasCustomImage && $serviceImageUrl)
                             <div class="service-card-image-wrap position-relative" style="height: 155px; background: #0f172a; overflow: hidden;">
-                                <img src="{{ asset($service->image_url) }}" alt="{{ $service->name }}" class="service-card-img w-100 h-100" style="object-fit: cover;" loading="lazy">
+                                <img src="{{ $serviceImageUrl }}" alt="{{ $service->name }}" class="service-card-img w-100 h-100" style="object-fit: cover;" loading="lazy">
                                 <span class="svc-category-pill">{{ $categoryLabels[$categoryKey] ?? 'Official Service' }}</span>
                                 <div class="svc-corner-seal" title="Verified Consular Service">
                                     <i class="bi bi-patch-check-fill text-warning" style="font-size:13px;"></i>

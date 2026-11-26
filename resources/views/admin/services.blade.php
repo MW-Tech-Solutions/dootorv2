@@ -53,6 +53,28 @@
 
 @section('content')
 <div class="container-fluid px-0">
+    @if(session('success'))
+        <div class="alert alert-success alert-dismissible fade show rounded-4 shadow-sm mb-4" role="alert">
+            <i class="bi bi-check-circle-fill me-2"></i> {{ session('success') }}
+            <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+        </div>
+    @endif
+
+    @if(session('error') || $errors->any())
+        <div class="alert alert-danger alert-dismissible fade show rounded-4 shadow-sm mb-4" role="alert">
+            <i class="bi bi-exclamation-triangle-fill me-2"></i>
+            {{ session('error') ?? 'Please check the form for errors:' }}
+            @if($errors->any())
+                <ul class="mb-0 mt-2 small">
+                    @foreach($errors->all() as $err)
+                        <li>{{ $err }}</li>
+                    @endforeach
+                </ul>
+            @endif
+            <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+        </div>
+    @endif
+
     <!-- Header Section -->
     <div class="d-flex flex-column flex-md-row justify-content-between align-items-start align-items-md-center mb-4 gap-3">
         <div>
@@ -650,7 +672,7 @@
                                 </label>
                                 @if(!empty($service->image_url))
                                     <div class="d-flex align-items-center gap-3 p-2 bg-light rounded-3 mb-2 border">
-                                        <img src="{{ asset($service->image_url) }}" alt="Preview" class="rounded" style="width: 60px; height: 40px; object-fit: cover;">
+                                        <img src="{{ \App\Helpers\StorageHelper::url($service->image_url) }}" alt="Preview" class="rounded" style="width: 60px; height: 40px; object-fit: cover;">
                                         <div class="flex-grow-1 min-w-0">
                                             <span class="d-block text-truncate small fw-semibold text-dark">{{ $service->image_url }}</span>
                                             <span class="text-success extra-small">Active custom image</span>

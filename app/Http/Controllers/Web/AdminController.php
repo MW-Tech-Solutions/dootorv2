@@ -335,7 +335,7 @@ class AdminController extends Controller
             'priority' => ['nullable', 'integer', 'min:0'],
             'required_documents' => ['nullable', 'array'],
             'custom_fields' => ['nullable', 'array'],
-            'image' => ['nullable', 'image', 'mimes:jpg,jpeg,png,webp,svg', 'max:5120'],
+            'image' => ['nullable', 'file', 'mimes:jpg,jpeg,png,webp,svg,gif,bmp', 'max:15360'],
         ]);
 
         if (!empty($data['parent_id'])) {
@@ -348,9 +348,11 @@ class AdminController extends Controller
         $data['priority'] = (int) ($data['priority'] ?? 0);
 
         if ($request->hasFile('image')) {
-            $path = $request->file('image')->store('services', 'public');
+            $path = \App\Helpers\FileUploadHelper::store($request->file('image'), 'services');
             $data['image_url'] = 'storage/' . $path;
         }
+
+        unset($data['image']);
 
         Service::create($data);
 
@@ -374,7 +376,7 @@ class AdminController extends Controller
             'priority' => ['nullable', 'integer', 'min:0'],
             'required_documents' => ['nullable', 'array'],
             'custom_fields' => ['nullable', 'array'],
-            'image' => ['nullable', 'image', 'mimes:jpg,jpeg,png,webp,svg', 'max:5120'],
+            'image' => ['nullable', 'file', 'mimes:jpg,jpeg,png,webp,svg,gif,bmp', 'max:15360'],
             'remove_image' => ['nullable', 'boolean'],
         ]);
 
@@ -392,9 +394,11 @@ class AdminController extends Controller
         if ($request->boolean('remove_image')) {
             $data['image_url'] = null;
         } elseif ($request->hasFile('image')) {
-            $path = $request->file('image')->store('services', 'public');
+            $path = \App\Helpers\FileUploadHelper::store($request->file('image'), 'services');
             $data['image_url'] = 'storage/' . $path;
         }
+
+        unset($data['image'], $data['remove_image']);
 
         $service->update($data);
 
