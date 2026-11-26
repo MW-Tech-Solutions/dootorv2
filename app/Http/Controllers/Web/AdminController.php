@@ -1,0 +1,2101 @@
+<?php
+
+namespace App\Http\Controllers\Web;
+
+use App\Http\Controllers\Controller;
+use App\Models\DocumentType;
+use App\Models\Faq;
+use App\Models\RequestDocument;
+use App\Models\Service;
+use App\Models\ServiceRequest;
+use App\Models\SystemSetting;
+use App\Models\User;
+use App\Services\ApplicationExpirationService;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\Rule;
+
+class AdminController extends Controller
+{
+    public function dashboard()
+    {
+        $total_users = User::where('role', 'client')->count();
+        $active_services = Service::where('status', 'Active')->count();
+        $total_requests = ServiceRequest::count();
+        $pending_requests = ServiceRequest::whereIn('status', ['Awaiting Payment', 'Documents Under Review', 'Processing', 'Awaiting External Agency'])->count();
+        $recent_requests = ServiceRequest::with('client')->latest()->take(5)->get();
+
+        return view('admin.dashboard', [
+            'total_users' => $total_users,
+            'active_services' => $active_services,
+            'total_requests' => $total_requests,
+            'pending_requests' => $pending_requests,
+            'recent_requests' => $recent_requests,
+        ]);
+    }
+
+    public function approvals()
+    {
+        $pendingVendors = User::where('role', 'vendor')
+            ->where('status', 'Pending')
+            ->with('kycProfile')
+            ->latest()
+            ->get();
+
+        return view('admin.approvals', [
+            'pending_vendors' => $pendingVendors,
+        ]);
+    }
+
+    public function approveVendor(Request $request, User $vendor)
+    {
+        $vendor->update(['status' => 'Approved']);
+        if ($vendor->kycProfile) {
+            $vendor->kycProfile->update(['status' => 'Approved']);
+        }
+
+        return redirect()->back()->with('success', 'Vendor has been approved successfully.');
+    }
+
+    public function rejectVendor(Request $request, User $vendor)
+    {
+        $request->validate([
+            'rejection_reason' => ['required', 'string', 'max:1000'],
+        ]);
+
+        $vendor->update(['status' => 'Rejected']);
+        if ($vendor->kycProfile) {
+            $vendor->kycProfile->update([
+                'status' => 'Rejected',
+                'rejection_reason' => $request->rejection_reason,
+            ]);
+        }
+
+        return redirect()->back()->with('success', 'Vendor application rejected.');
+    }
+
+    public function users(Request $request)
+    {
+        $query = User::query()->with(['kycProfile', 'storefrontSetting', 'roles'])->latest();
+
+        if ($role = $request->query('role')) {
+            $query->where(function ($q) use ($role) {
+                $q->where('role', $role)
+                  ->orWhereHas('roles', function ($rQ) use ($role) {
+                      $rQ->where('slug', $role)->orWhere('name', $role)->orWhere('roles.id', $role);
+                  });
+            });
+        }
+
+        if ($status = $request->query('status')) {
+            $query->where('status', $status);
+        }
+
+        $users = $query->paginate(20)->withQueryString();
+        $users->getCollection()->transform(function ($u) {
+            if ($u->role !== 'client') {
+                $u->assigned_count = \App\Models\ServiceRequest::where('assigned_staff_id', $u->id)->count();
+                $u->completed_count = \App\Models\ServiceRequest::where('assigned_staff_id', $u->id)->where('status', 'Completed')->count();
+                $u->pending_count = \App\Models\ServiceRequest::where('assigned_staff_id', $u->id)->whereNotIn('status', ['Completed', 'Rejected', 'Cancelled'])->count();
+                $u->recent_activity = \App\Models\AuditLog::where('user_id', $u->id)->latest()->take(5)->get();
+            }
+            return $u;
+        });
+        $roles = \App\Models\Role::where('is_active', true)->orderBy('name', 'asc')->get();
+
+        return view('admin.users', [
+            'users' => $users,
+            'roles' => $roles,
+        ]);
+    }
+
+    public function storeUser(Request $request)
+    {
+        $allRoleSlugs = \App\Models\Role::pluck('slug')->toArray();
+        $allRoleIds = \App\Models\Role::pluck('id')->toArray();
+        $allowedRoles = array_unique(array_merge(['admin', 'vendor', 'client'], $allRoleSlugs, array_map('strval', $allRoleIds)));
+
+        $data = $request->validate([
+            'first_name' => ['required', 'string', 'max:255'],
+            'last_name' => ['required', 'string', 'max:255'],
+            'email' => ['required', 'email', 'max:255', 'unique:users,email'],
+            'phone' => ['nullable', 'string', 'max:50'],
+            'password' => ['required', 'string', 'min:8'],
+            'role' => ['required', Rule::in($allowedRoles)],
+            'status' => ['required', Rule::in(['Approved', 'Pending', 'Disabled'])],
+        ]);
+
+        $selectedVal = $data['role'];
+        $roleModel = is_numeric($selectedVal)
+            ? \App\Models\Role::find((int) $selectedVal)
+            : \App\Models\Role::where('slug', $selectedVal)->orWhere('name', $selectedVal)->first();
+
+        $baseRole = ($roleModel && in_array($roleModel->slug, ['client', 'vendor'])) || in_array($selectedVal, ['client', 'vendor'])
+            ? ($roleModel->slug ?? $selectedVal)
+            : 'admin';
+
+        $user = User::create([
+            'first_name' => $data['first_name'],
+            'last_name' => $data['last_name'],
+            'email' => $data['email'],
+            'phone' => $data['phone'] ?? null,
+            'password' => \Illuminate\Support\Facades\Hash::make($data['password']),
+            'role' => $baseRole,
+            'status' => $data['status'],
+        ]);
+
+        if ($roleModel) {
+            $user->roles()->sync([$roleModel->id]);
+        }
+
+        return redirect()->back()->with('success', 'Staff/User account created and role assigned successfully.');
+    }
+
+    /**
+     * Admin Shortcut: Create Client & Request Service on Behalf
+     */
+    public function proxyBooking()
+    {
+        $clients = User::where('role', 'client')->orderBy('first_name')->get(['id', 'first_name', 'last_name', 'email']);
+        $services = Service::whereNull('parent_id')
+            ->with(['subServices' => fn($q) => $q->orderBy('name')])
+            ->orderBy('name')
+            ->get();
+        $staffMembers = User::where('role', 'admin')->with('roles')->orderBy('first_name')->get();
+
+        return view('admin.proxy-booking', compact('clients', 'services', 'staffMembers'));
+    }
+
+    public function storeProxyBooking(Request $request)
+    {
+        $request->validate([
+            'client_mode' => ['required', Rule::in(['new', 'existing'])],
+            'existing_client_id' => ['required_if:client_mode,existing', 'nullable', 'exists:users,id'],
+            'first_name' => ['required_if:client_mode,new', 'nullable', 'string', 'max:255'],
+            'last_name' => ['required_if:client_mode,new', 'nullable', 'string', 'max:255'],
+            'email' => ['required_if:client_mode,new', 'nullable', 'email', 'max:255', 'unique:users,email'],
+            'phone' => ['nullable', 'string', 'max:50'],
+            'password' => ['nullable', 'string', 'min:8'],
+            'service_id' => ['required', 'exists:services,id'],
+            'sub_service_id' => ['nullable', 'exists:services,id'],
+            'country_applying_from' => ['nullable', 'string', 'max:120'],
+            'country_service_requested' => ['nullable', 'string', 'max:120'],
+            'payment_status' => ['required', Rule::in(['Paid', 'Unpaid'])],
+            'assigned_staff_id' => ['nullable', 'exists:users,id'],
+            'notes' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        if ($request->client_mode === 'new') {
+            $client = User::create([
+                'first_name' => $request->first_name,
+                'last_name' => $request->last_name,
+                'email' => $request->email,
+                'phone' => $request->phone,
+                'password' => \Illuminate\Support\Facades\Hash::make($request->password ?: 'Dootor@1234'),
+                'role' => 'client',
+                'status' => 'Approved',
+            ]);
+        } else {
+            $client = User::findOrFail($request->existing_client_id);
+        }
+
+        $primaryService = Service::findOrFail($request->service_id);
+        $subService = $request->sub_service_id ? Service::find($request->sub_service_id) : null;
+        $price = $subService && $subService->price > 0 ? $subService->price : ($primaryService->price ?? 0);
+        $isPaid = $request->payment_status === 'Paid';
+        $ref = 'DTR-' . strtoupper(\Illuminate\Support\Str::random(8));
+
+        $sr = \App\Models\ServiceRequest::create([
+            'reference_number' => $ref,
+            'application_method' => 'admin_proxy',
+            'service_id' => $primaryService->id,
+            'sub_service_id' => $subService?->id,
+            'service_name' => $primaryService->name,
+            'sub_service_name' => $subService?->name,
+            'price' => $price,
+            'amount_paid' => $isPaid ? $price : 0,
+            'outstanding_balance' => $isPaid ? 0 : $price,
+            'client_id' => $client->id,
+            'client_name' => $client->name,
+            'client_email' => $client->email,
+            'country_applying_from' => $request->country_applying_from ?: 'Global',
+            'country_service_requested' => $request->country_service_requested ?: 'International',
+            'assigned_staff_id' => $request->assigned_staff_id ?: null,
+            'assigned_at' => $request->assigned_staff_id ? now() : null,
+            'status' => $request->assigned_staff_id ? \App\Models\ServiceRequest::STATUS_ASSIGNED : \App\Models\ServiceRequest::STATUS_SUBMITTED,
+            'payment_status' => $request->payment_status,
+            'payment_gateway' => $isPaid ? 'admin_offline' : null,
+            'submitted_at' => now(),
+            'form_data' => $request->notes ? ['admin_proxy_notes' => $request->notes, 'created_by_admin' => Auth::user()->name] : ['created_by_admin' => Auth::user()->name],
+        ]);
+
+        return redirect()->back()->with('success', "Service request <strong>{$sr->reference_number}</strong> created for <strong>{$client->name}</strong>.");
+    }
+
+    public function updateUser(Request $request, User $user)
+    {
+        $allRoleSlugs = \App\Models\Role::pluck('slug')->toArray();
+        $allRoleIds = \App\Models\Role::pluck('id')->toArray();
+        $allowedRoles = array_unique(array_merge(['admin', 'vendor', 'client', 'super_admin', 'manager', 'processing_officer', 'finance_officer'], $allRoleSlugs, array_map('strval', $allRoleIds)));
+
+        $data = $request->validate([
+            'status' => ['sometimes', Rule::in(['Approved', 'Pending', 'Rejected', 'Disabled'])],
+            'role' => ['sometimes', Rule::in($allowedRoles)],
+            'first_name' => ['sometimes', 'string', 'max:255'],
+            'last_name' => ['sometimes', 'string', 'max:255'],
+            'phone' => ['nullable', 'string', 'max:50'],
+            'country' => ['nullable', 'string', Rule::in(\App\Services\AfricanLocationService::countryNames())],
+            'state' => ['nullable', 'string', 'max:255'],
+        ]);
+
+        if (!empty($data['country']) && !empty($data['state'])) {
+            if (!\App\Services\AfricanLocationService::isValidPair($data['country'], $data['state'])) {
+                throw \Illuminate\Validation\ValidationException::withMessages([
+                    'state' => ["The selected state/region does not belong to {$data['country']}."],
+                ]);
+            }
+        }
+
+        if (isset($data['role'])) {
+            $selectedVal = $data['role'];
+            $roleModel = null;
+            if (is_numeric($selectedVal)) {
+                $roleModel = \App\Models\Role::find((int) $selectedVal);
+            } else {
+                $roleModel = \App\Models\Role::where('slug', $selectedVal)->orWhere('name', $selectedVal)->first();
+            }
+
+            if ($roleModel) {
+                $user->roles()->sync([$roleModel->id]);
+                if (in_array($roleModel->slug, ['client', 'vendor'])) {
+                    $data['role'] = $roleModel->slug;
+                } else {
+                    $data['role'] = 'admin';
+                }
+            } else {
+                if (in_array($selectedVal, ['client', 'vendor'])) {
+                    $user->roles()->detach();
+                }
+            }
+        }
+
+        $user->update($data);
+
+        return redirect()->back()->with('success', 'User profile and role updated successfully.');
+    }
+
+    public function deleteUser(User $user)
+    {
+        $user->delete();
+        return redirect()->back()->with('success', 'User deleted successfully.');
+    }
+
+    public function services()
+    {
+        $primaryServices = Service::whereNull('parent_id')
+            ->with(['subServices', 'fields', 'workflowStages'])
+            ->latest()
+            ->get();
+
+        $subServices = Service::whereNotNull('parent_id')
+            ->with(['parent', 'fields', 'workflowStages'])
+            ->latest()
+            ->get();
+
+        $allPrimaryServices = Service::whereNull('parent_id')
+            ->orderBy('name', 'asc')
+            ->get();
+
+        $services = Service::with(['parent', 'subServices', 'fields', 'workflowStages'])
+            ->latest()
+            ->get();
+
+        return view('admin.services', [
+            'services' => $services,
+            'primaryServices' => $primaryServices,
+            'subServices' => $subServices,
+            'allPrimaryServices' => $allPrimaryServices,
+        ]);
+    }
+
+    public function storeService(Request $request)
+    {
+        $data = $request->validate([
+            'name' => ['required', 'string', 'max:255'],
+            'parent_id' => ['nullable', 'exists:services,id'],
+            'category' => ['nullable', 'string', 'max:255'],
+            'price' => ['required', 'numeric', 'min:0'],
+            'service_fee' => ['nullable', 'numeric', 'min:0'],
+            'processing_fee' => ['nullable', 'numeric', 'min:0'],
+            'processing_days' => ['nullable', 'integer', 'min:1'],
+            'description' => ['required', 'string'],
+            'short_description' => ['nullable', 'string', 'max:500'],
+            'status' => ['sometimes', Rule::in(['Active', 'Inactive'])],
+            'is_primary' => ['nullable', 'boolean'],
+            'priority' => ['nullable', 'integer', 'min:0'],
+            'required_documents' => ['nullable', 'array'],
+            'custom_fields' => ['nullable', 'array'],
+            'image' => ['nullable', 'image', 'mimes:jpg,jpeg,png,webp,svg', 'max:5120'],
+        ]);
+
+        if (!empty($data['parent_id'])) {
+            $data['is_primary'] = false;
+        } else {
+            $data['parent_id'] = null;
+            $data['is_primary'] = $request->has('is_primary') ? $request->boolean('is_primary') : true;
+        }
+
+        $data['priority'] = (int) ($data['priority'] ?? 0);
+
+        if ($request->hasFile('image')) {
+            $path = $request->file('image')->store('services', 'public');
+            $data['image_url'] = 'storage/' . $path;
+        }
+
+        Service::create($data);
+
+        return redirect()->back()->with('success', 'Service created successfully.');
+    }
+
+    public function updateService(Request $request, Service $service)
+    {
+        $data = $request->validate([
+            'name' => ['required', 'string', 'max:255'],
+            'parent_id' => ['nullable', 'exists:services,id', Rule::notIn([$service->id])],
+            'category' => ['nullable', 'string', 'max:255'],
+            'price' => ['required', 'numeric', 'min:0'],
+            'service_fee' => ['nullable', 'numeric', 'min:0'],
+            'processing_fee' => ['nullable', 'numeric', 'min:0'],
+            'processing_days' => ['nullable', 'integer', 'min:1'],
+            'description' => ['required', 'string'],
+            'short_description' => ['nullable', 'string', 'max:500'],
+            'status' => ['sometimes', Rule::in(['Active', 'Inactive'])],
+            'is_primary' => ['nullable', 'boolean'],
+            'priority' => ['nullable', 'integer', 'min:0'],
+            'required_documents' => ['nullable', 'array'],
+            'custom_fields' => ['nullable', 'array'],
+            'image' => ['nullable', 'image', 'mimes:jpg,jpeg,png,webp,svg', 'max:5120'],
+            'remove_image' => ['nullable', 'boolean'],
+        ]);
+
+        if (!empty($data['parent_id'])) {
+            $data['is_primary'] = false;
+        } else {
+            $data['parent_id'] = null;
+            $data['is_primary'] = $request->has('is_primary') ? $request->boolean('is_primary') : true;
+        }
+
+        if (array_key_exists('priority', $data)) {
+            $data['priority'] = (int) ($data['priority'] ?? 0);
+        }
+
+        if ($request->boolean('remove_image')) {
+            $data['image_url'] = null;
+        } elseif ($request->hasFile('image')) {
+            $path = $request->file('image')->store('services', 'public');
+            $data['image_url'] = 'storage/' . $path;
+        }
+
+        $service->update($data);
+
+        return redirect()->back()->with('success', 'Service updated successfully.');
+    }
+
+    public function makeSubService(Request $request, Service $service)
+    {
+        $data = $request->validate([
+            'parent_id' => ['required', 'exists:services,id', Rule::notIn([$service->id])],
+        ]);
+
+        $motherService = Service::findOrFail($data['parent_id']);
+
+        $service->update([
+            'parent_id' => $motherService->id,
+            'is_primary' => false,
+        ]);
+
+        return redirect()->back()->with('success', "Service '{$service->name}' is now a sub-service under mother primary service '{$motherService->name}'.");
+    }
+
+    public function makePrimaryService(Service $service)
+    {
+        $service->update([
+            'parent_id' => null,
+            'is_primary' => true,
+        ]);
+
+        return redirect()->back()->with('success', "Service '{$service->name}' has been successfully converted into an independent Primary Service.");
+    }
+
+    public function deleteService(Service $service)
+    {
+        $service->delete();
+        return redirect()->back()->with('success', 'Service deleted successfully.');
+    }
+
+    public function settings()
+    {
+        $settings = SystemSetting::firstOrCreate([]);
+        return view('admin.settings', [
+            'settings' => $settings,
+        ]);
+    }
+
+    public function updateSettings(Request $request)
+    {
+        $data = $request->validate([
+            'platform_name' => ['nullable', 'string', 'max:255'],
+            'company_name' => ['nullable', 'string', 'max:255'],
+            'logo_url' => ['nullable', 'string', 'max:2048'],
+            'logo_file' => ['nullable', 'image', 'mimes:png,jpg,jpeg,gif,svg,webp', 'max:5120'],
+            'brand_template' => ['nullable', Rule::in(['classic', 'editorial', 'compact', 'showcase'])],
+            'brand_theme' => ['nullable', Rule::in(['light', 'dark'])],
+            'brand_color_palette' => ['nullable', Rule::in(['default', 'blue', 'green', 'purple', 'red', 'orange', 'yellow', 'teal'])],
+            'brand_primary_color' => ['nullable', 'string', 'max:20'],
+            'brand_secondary_color' => ['nullable', 'string', 'max:20'],
+            'brand_gradient_from' => ['nullable', 'string', 'max:20'],
+            'brand_gradient_to' => ['nullable', 'string', 'max:20'],
+            'hero_badge_text' => ['nullable', 'string', 'max:255'],
+            'hero_title' => ['nullable', 'string', 'max:255'],
+            'hero_subtitle' => ['nullable', 'string'],
+            'hero_bg_file' => ['nullable', 'image', 'mimes:png,jpg,jpeg,gif,webp', 'max:10240'],
+            'hero_glass_style' => ['nullable', Rule::in(['light_glass', 'dark_glass', 'emerald_glass', 'subtle_glass'])],
+            'remove_hero_bg' => ['nullable', 'boolean'],
+            'default_currency' => ['nullable', 'string', 'max:10'],
+            'maintenance_mode' => ['nullable', 'boolean'],
+            'payment_gateway' => ['nullable', Rule::in(['paypal', 'moneris', 'credo', 'paystack'])],
+            'payments_enabled' => ['nullable', 'boolean'],
+            'payment_mode' => ['nullable', Rule::in(['test', 'live'])],
+            'paystack_public_key' => ['nullable', 'string'],
+            'paystack_secret_key' => ['nullable', 'string'],
+            'paystack_base_url' => ['nullable', 'string'],
+            'credo_public_key' => ['nullable', 'string'],
+            'credo_secret_key' => ['nullable', 'string'],
+            'credo_base_url' => ['nullable', 'string'],
+            'paypal_client_id' => ['nullable', 'string', 'max:500'],
+            'paypal_client_secret' => ['nullable', 'string', 'max:500'],
+            'moneris_store_id' => ['nullable', 'string', 'max:255'],
+            'moneris_api_token' => ['nullable', 'string', 'max:255'],
+            'moneris_checkout_id' => ['nullable', 'string', 'max:255'],
+            'terms_conditions' => ['nullable', 'string'],
+            'refund_policy' => ['nullable', 'string'],
+            'privacy_policy' => ['nullable', 'string'],
+            'facebook_url' => ['nullable', 'string', 'max:255'],
+            'twitter_url' => ['nullable', 'string', 'max:255'],
+            'instagram_url' => ['nullable', 'string', 'max:255'],
+            'linkedin_url' => ['nullable', 'string', 'max:255'],
+            'whatsapp_number' => ['nullable', 'string', 'max:50'],
+            'youtube_url' => ['nullable', 'string', 'max:255'],
+            'promo_video_url' => ['nullable', 'string', 'max:500'],
+            'promo_video_title' => ['nullable', 'string', 'max:255'],
+            'tiktok_url' => ['nullable', 'string', 'max:255'],
+            'contact_email' => ['nullable', 'email', 'max:255'],
+            'contact_phone' => ['nullable', 'string', 'max:50'],
+            'contact_address' => ['nullable', 'string', 'max:1000'],
+            'draft_expiry_value' => ['nullable', 'integer', 'min:1', 'max:365'],
+            'draft_expiry_unit' => ['nullable', Rule::in(['days', 'months'])],
+            'paid_incomplete_expiry_value' => ['nullable', 'integer', 'min:1', 'max:365'],
+            'paid_incomplete_expiry_unit' => ['nullable', Rule::in(['days', 'months'])],
+            'auto_purge_enabled' => ['nullable', 'boolean'],
+            'purge_action' => ['nullable', Rule::in(['delete', 'mark_expired'])],
+            'gemini_api_key' => ['nullable', 'string', 'max:500'],
+            'chatbot_enabled' => ['nullable', 'boolean'],
+            'chatbot_system_prompt' => ['nullable', 'string', 'max:4000'],
+        ]);
+
+        if ($request->hasFile('logo_file')) {
+            $path = \App\Helpers\FileUploadHelper::store($request->file('logo_file'), 'branding');
+            $data['logo_url'] = '/storage/' . $path;
+        }
+
+        if ($request->hasFile('hero_bg_file')) {
+            $path = \App\Helpers\FileUploadHelper::store($request->file('hero_bg_file'), 'branding');
+            $data['hero_bg_image'] = '/storage/' . $path;
+        } elseif ($request->boolean('remove_hero_bg')) {
+            $data['hero_bg_image'] = null;
+        }
+
+        unset($data['logo_file'], $data['hero_bg_file'], $data['remove_hero_bg']);
+
+        // Only update fields that were actually submitted by the specific tab form
+        $submittedKeys = array_keys($request->all());
+        if (isset($data['logo_url'])) $submittedKeys[] = 'logo_url';
+        if (isset($data['hero_bg_image'])) $submittedKeys[] = 'hero_bg_image';
+        $data = array_intersect_key($data, array_flip($submittedKeys));
+
+        // Auto-repair missing policy columns on production table if migration has not run yet
+        foreach (['privacy_policy', 'terms_conditions', 'refund_policy'] as $policyCol) {
+            if (!\Illuminate\Support\Facades\Schema::hasColumn('system_settings', $policyCol)) {
+                try {
+                    \Illuminate\Support\Facades\Schema::table('system_settings', function (\Illuminate\Database\Schema\Blueprint $table) use ($policyCol) {
+                        $table->longText($policyCol)->nullable();
+                    });
+                } catch (\Throwable $e) {
+                    \Illuminate\Support\Facades\Log::warning("Auto-schema check for {$policyCol} failed: " . $e->getMessage());
+                }
+            }
+        }
+
+        // Filter data to only include columns that exist in the system_settings table
+        if (\Illuminate\Support\Facades\Schema::hasTable('system_settings')) {
+            $tableColumns = \Illuminate\Support\Facades\Schema::getColumnListing('system_settings');
+            $data = array_intersect_key($data, array_flip($tableColumns));
+        }
+
+        $settings = SystemSetting::firstOrCreate([]);
+
+        $oldCurrency = strtoupper((string) ($settings->default_currency ?: config('services.payment.currency') ?: 'NGN'));
+        $newCurrency = strtoupper((string) ($data['default_currency'] ?? $oldCurrency));
+
+        if (!empty($newCurrency) && $oldCurrency !== $newCurrency) {
+            \App\Helpers\CurrencyConverter::convertPrices($oldCurrency, $newCurrency);
+        }
+
+        $settings->update($data);
+
+        return redirect()->back()->with('success', 'System settings updated successfully. Service prices updated to match new billing currency!');
+    }
+
+    public function faqs()
+    {
+        $faqs = Faq::orderBy('sort_order', 'asc')->latest()->get();
+        return view('admin.faqs', compact('faqs'));
+    }
+
+    public function storeFaq(Request $request)
+    {
+        $data = $request->validate([
+            'question' => ['required', 'string', 'max:255'],
+            'answer' => ['required', 'string'],
+            'category' => ['nullable', 'string', 'max:100'],
+            'sort_order' => ['nullable', 'integer'],
+            'status' => ['required', Rule::in(['Active', 'Inactive'])],
+        ]);
+
+        $data['sort_order'] = $data['sort_order'] ?? 0;
+
+        Faq::create($data);
+
+        return redirect()->back()->with('success', 'FAQ entry created successfully.');
+    }
+
+    public function updateFaq(Request $request, Faq $faq)
+    {
+        $data = $request->validate([
+            'question' => ['required', 'string', 'max:255'],
+            'answer' => ['required', 'string'],
+            'category' => ['nullable', 'string', 'max:100'],
+            'sort_order' => ['nullable', 'integer'],
+            'status' => ['required', Rule::in(['Active', 'Inactive'])],
+        ]);
+
+        $data['sort_order'] = $data['sort_order'] ?? 0;
+
+        $faq->update($data);
+
+        return redirect()->back()->with('success', 'FAQ entry updated successfully.');
+    }
+
+    public function deleteFaq(Faq $faq)
+    {
+        $faq->delete();
+        return redirect()->back()->with('success', 'FAQ entry deleted successfully.');
+    }
+
+    public function subscriptions(Request $request)
+    {
+        $search = $request->query('search');
+        $filter = $request->query('filter', 'all');
+        $perPage = (int) $request->query('per_page', 10);
+        if (!in_array($perPage, [5, 10, 20, 50])) {
+            $perPage = 10;
+        }
+
+        $query = ServiceRequest::query()
+            ->with(['client', 'service', 'subService', 'requestDocuments', 'assignedStaff', 'currentStage', 'assignmentHistories.newStaff'])
+            ->latest();
+
+        if ($filter === 'unassigned') {
+            $query->whereNull('assigned_staff_id');
+        } elseif ($filter === 'assigned') {
+            $query->whereNotNull('assigned_staff_id');
+        } elseif ($filter === 'submitted') {
+            $query->whereIn('status', ['Application Submitted', 'Awaiting Assignment']);
+        } elseif ($filter === 'drafts') {
+            $query->whereIn('status', ['Draft', 'In Progress']);
+        }
+
+        if ($search) {
+            $query->where(function ($q) use ($search) {
+                $q->where('id', $search)
+                  ->orWhere('reference_number', 'like', "%{$search}%")
+                  ->orWhere('payment_reference', 'like', "%{$search}%")
+                  ->orWhere('service_name', 'like', "%{$search}%")
+                  ->orWhereHas('client', function ($qc) use ($search) {
+                      $qc->where('first_name', 'like', "%{$search}%")
+                         ->orWhere('last_name', 'like', "%{$search}%")
+                         ->orWhere('email', 'like', "%{$search}%")
+                         ->orWhere('phone', 'like', "%{$search}%");
+                  });
+            });
+        }
+
+        $serviceRequests = $query->paginate($perPage)->withQueryString();
+        
+        $staffMembers = User::where(function ($q) {
+            $q->whereIn('role', ['admin', 'manager', 'processing_officer', 'super_admin'])
+              ->orWhereHas('roles');
+        })->where('role', '!=', 'client')->orderBy('first_name')->get();
+
+        $stats = [
+            'total' => ServiceRequest::count(),
+            'unassigned' => ServiceRequest::whereNull('assigned_staff_id')->count(),
+            'assigned' => ServiceRequest::whereNotNull('assigned_staff_id')->count(),
+            'submitted' => ServiceRequest::whereIn('status', ['Application Submitted', 'Awaiting Assignment'])->count(),
+            'drafts' => ServiceRequest::whereIn('status', ['Draft', 'In Progress'])->count(),
+        ];
+
+        return view('admin.subscriptions', [
+            'serviceRequests' => $serviceRequests,
+            'search' => $search,
+            'filter' => $filter,
+            'perPage' => $perPage,
+            'staffMembers' => $staffMembers,
+            'stats' => $stats,
+        ]);
+    }
+
+    public function assignStaff(Request $request, ServiceRequest $serviceRequest)
+    {
+        $data = $request->validate([
+            'assigned_staff_id' => ['required', 'exists:users,id'],
+            'assignment_notes' => ['nullable', 'string', 'max:1000'],
+        ]);
+
+        $staff = User::findOrFail($data['assigned_staff_id']);
+        $oldStaffId = $serviceRequest->assigned_staff_id;
+
+        $newStatus = in_array($serviceRequest->status, ['Draft', 'Application Submitted', 'Awaiting Assignment']) ? 'Assigned' : $serviceRequest->status;
+
+        $serviceRequest->update([
+            'assigned_staff_id' => $staff->id,
+            'assigned_at' => now(),
+            'status' => $newStatus,
+        ]);
+
+        // Record Assignment History
+        \App\Models\AssignmentHistory::create([
+            'service_request_id' => $serviceRequest->id,
+            'previous_staff_id' => $oldStaffId,
+            'new_staff_id' => $staff->id,
+            'assigned_by_id' => auth()->id(),
+            'notes' => $data['assignment_notes'] ?? null,
+            'assigned_at' => now(),
+        ]);
+
+        // Record Audit Log with Staff File Number
+        \App\Services\AuditLogger::log(
+            'application_assigned',
+            'ServiceRequest',
+            (string) $serviceRequest->id,
+            $serviceRequest->reference_number,
+            ['assigned_staff_id' => $oldStaffId],
+            [
+                'assigned_staff_id' => $staff->id,
+                'staff_name' => $staff->name,
+                'staff_file_number' => $staff->staff_file_number,
+                'notes' => $data['assignment_notes'] ?? null
+            ]
+        );
+
+        // Send Email Notification to Assigned Staff
+        \App\Services\EmailNotificationService::send(
+            'application_assigned_staff',
+            $staff->email,
+            [
+                'staff_name' => $staff->name,
+                'staff_file_number' => $staff->staff_file_number ?? 'N/A',
+                'reference_number' => $serviceRequest->reference_number,
+                'client_name' => $serviceRequest->client_name,
+                'service_name' => $serviceRequest->service_name,
+                'assigned_by' => auth()->user()->name,
+                'notes' => $data['assignment_notes'] ?? 'None',
+            ],
+            $serviceRequest,
+            $staff
+        );
+
+        return redirect()->back()->with('success', "Application {$serviceRequest->reference_number} assigned to {$staff->name} ({$staff->staff_file_number}) successfully.");
+    }
+
+    public function updateSubscriptionStatus(Request $request, ServiceRequest $serviceRequest)
+    {
+        return $this->assignStaff($request, $serviceRequest);
+    }
+
+    public function updateDocumentStatus(Request $request, \App\Models\RequestDocument $document)
+    {
+        $data = $request->validate([
+            'status' => ['required', Rule::in(['Pending', 'Received', 'Accepted', 'Requires Correction', 'Rejected'])],
+            'admin_notes' => ['nullable', 'string', 'max:1000'],
+        ]);
+
+        $oldStatus = $document->status;
+        $document->update([
+            'status' => $data['status'],
+            'admin_notes' => $data['admin_notes'] ?? $document->admin_notes,
+        ]);
+
+        $serviceRequest = $document->serviceRequest;
+        if ($serviceRequest && $data['status'] === 'Accepted') {
+            if ($serviceRequest->status === 'Application Submitted') {
+                $serviceRequest->update(['status' => 'Documents Under Review']);
+            }
+        }
+
+        $user = auth()->user();
+        \App\Services\AuditLogger::log(
+            'document_status_updated',
+            'RequestDocument',
+            (string) $document->id,
+            $document->document_name,
+            ['status' => $oldStatus],
+            ['status' => $document->status, 'staff_file_number' => $user->staff_file_number, 'notes' => $data['admin_notes'] ?? null]
+        );
+
+        return redirect()->back()->with('success', 'Document status for "' . $document->document_name . '" updated to ' . $data['status'] . '.');
+    }
+
+    // --- Dynamic Service Form Builder ---
+    public function formBuilder(Service $service)
+    {
+        $fields = $service->fields()->orderBy('sort_order', 'asc')->get();
+        return view('admin.form-builder', compact('service', 'fields'));
+    }
+
+    public function saveFormFields(Request $request, Service $service)
+    {
+        $data = $request->validate([
+            'fields' => ['nullable', 'array'],
+            'fields.*.id' => ['nullable', 'integer'],
+            'fields.*.field_label' => ['required', 'string', 'max:255'],
+            'fields.*.field_type' => ['required', 'string'],
+            'fields.*.placeholder' => ['nullable', 'string', 'max:255'],
+            'fields.*.help_text' => ['nullable', 'string', 'max:1000'],
+            'fields.*.is_required' => ['nullable', 'boolean'],
+            'fields.*.options' => ['nullable', 'string'], // Comma-separated or lines
+            'fields.*.allowed_file_types' => ['nullable', 'string', 'max:255'],
+            'fields.*.max_file_size' => ['nullable', 'integer', 'min:100'],
+            'fields.*.sort_order' => ['nullable', 'integer'],
+            'fields.*.is_enabled' => ['nullable', 'boolean'],
+        ]);
+
+        $existingIds = [];
+        if (!empty($data['fields'])) {
+            foreach ($data['fields'] as $index => $fData) {
+                $optionsArray = null;
+                if (!empty($fData['options'])) {
+                    $optionsArray = array_values(array_filter(array_map('trim', explode("\n", str_replace(',', "\n", $fData['options'])))));
+                }
+
+                $fieldSlug = \Illuminate\Support\Str::slug($fData['field_label'], '_');
+
+                $fieldRecord = \App\Models\ServiceField::updateOrCreate(
+                    [
+                        'id' => $fData['id'] ?? null,
+                        'service_id' => $service->id,
+                    ],
+                    [
+                        'field_label' => $fData['field_label'],
+                        'field_name' => $fieldSlug,
+                        'field_type' => $fData['field_type'],
+                        'placeholder' => $fData['placeholder'] ?? null,
+                        'help_text' => $fData['help_text'] ?? null,
+                        'is_required' => isset($fData['is_required']),
+                        'options' => $optionsArray,
+                        'allowed_file_types' => $fData['allowed_file_types'] ?? null,
+                        'max_file_size' => $fData['max_file_size'] ?? 10240,
+                        'sort_order' => $fData['sort_order'] ?? ($index + 1),
+                        'is_enabled' => isset($fData['is_enabled']),
+                    ]
+                );
+                $existingIds[] = $fieldRecord->id;
+            }
+        }
+
+        \App\Services\AuditLogger::log('service_form_updated', 'Service', (string) $service->id, null, null, ['field_count' => count($existingIds)]);
+
+        return redirect()->back()->with('success', 'Form fields configured successfully for ' . $service->name);
+    }
+
+    public function deleteFormField(\App\Models\ServiceField $field)
+    {
+        $serviceId = $field->service_id;
+        $field->delete();
+        \App\Services\AuditLogger::log('service_field_deleted', 'ServiceField', (string) $field->id);
+        return redirect()->back()->with('success', 'Form field deleted.');
+    }
+
+    // --- Service Workflow Builder ---
+    public function workflowBuilder(Service $service)
+    {
+        $stages = $service->workflowStages()->orderBy('sort_order', 'asc')->get();
+        $roles = \App\Models\Role::where('is_active', true)->get();
+        $staffUsers = User::whereIn('role', ['admin', 'vendor'])->get();
+
+        return view('admin.workflow-builder', compact('service', 'stages', 'roles', 'staffUsers'));
+    }
+
+    public function saveWorkflowStages(Request $request, Service $service)
+    {
+        $data = $request->validate([
+            'stages' => ['nullable', 'array'],
+            'stages.*.id' => ['nullable', 'integer'],
+            'stages.*.stage_name' => ['required', 'string', 'max:255'],
+            'stages.*.description' => ['nullable', 'string'],
+            'stages.*.status_key' => ['required', 'string'],
+            'stages.*.assigned_role_id' => ['nullable', 'exists:roles,id'],
+            'stages.*.assigned_user_id' => ['nullable', 'exists:users,id'],
+            'stages.*.estimated_days' => ['nullable', 'integer', 'min:1'],
+            'stages.*.sort_order' => ['nullable', 'integer'],
+            'stages.*.is_user_visible' => ['nullable', 'boolean'],
+            'stages.*.notification_enabled' => ['nullable', 'boolean'],
+        ]);
+
+        if (!empty($data['stages'])) {
+            foreach ($data['stages'] as $index => $sData) {
+                \App\Models\ServiceWorkflowStage::updateOrCreate(
+                    [
+                        'id' => $sData['id'] ?? null,
+                        'service_id' => $service->id,
+                    ],
+                    [
+                        'stage_name' => $sData['stage_name'],
+                        'description' => $sData['description'] ?? null,
+                        'status_key' => $sData['status_key'],
+                        'assigned_role_id' => $sData['assigned_role_id'] ?? null,
+                        'assigned_user_id' => $sData['assigned_user_id'] ?? null,
+                        'estimated_days' => $sData['estimated_days'] ?? null,
+                        'sort_order' => $sData['sort_order'] ?? ($index + 1),
+                        'is_user_visible' => isset($sData['is_user_visible']),
+                        'notification_enabled' => isset($sData['notification_enabled']),
+                    ]
+                );
+            }
+        }
+
+        \App\Services\AuditLogger::log('service_workflow_updated', 'Service', (string) $service->id);
+
+        return redirect()->back()->with('success', 'Workflow stages updated for ' . $service->name);
+    }
+
+    public function deleteWorkflowStage(\App\Models\ServiceWorkflowStage $stage)
+    {
+        $stage->delete();
+        \App\Services\AuditLogger::log('workflow_stage_deleted', 'ServiceWorkflowStage', (string) $stage->id);
+        return redirect()->back()->with('success', 'Workflow stage deleted.');
+    }
+
+    // --- Roles & Dynamic Granular RBAC ---
+    public function rolesIndex()
+    {
+        $roles = \App\Models\Role::with('permissions', 'users')->get();
+        $permissions = \App\Models\Permission::all()->groupBy('module');
+        $allUsers = User::orderBy('first_name')->get();
+
+        return view('admin.roles.index', compact('roles', 'permissions', 'allUsers'));
+    }
+
+    public function rolesStore(Request $request)
+    {
+        if (!$request->user()->hasPermission('roles.manage') && !$request->user()->hasPermission('roles.view')) {
+            abort(403, 'Unauthorized action. Permission required: roles.manage');
+        }
+
+        $data = $request->validate([
+            'name' => ['required', 'string', 'max:255'],
+            'description' => ['nullable', 'string', 'max:1000'],
+            'permissions' => ['nullable', 'array'],
+            'permissions.*' => ['exists:permissions,id'],
+        ]);
+
+        $slug = \Illuminate\Support\Str::slug($data['name']);
+        $role = \App\Models\Role::create([
+            'name' => $data['name'],
+            'slug' => $slug,
+            'description' => $data['description'] ?? null,
+            'is_active' => true,
+        ]);
+
+        if (!empty($data['permissions'])) {
+            $role->permissions()->sync($data['permissions']);
+        }
+
+        \Illuminate\Support\Facades\Cache::forget("role_permissions_{$role->id}");
+
+        \App\Services\AuditLogger::log('role_created', 'Role', (string) $role->id, null, null, [
+            'name' => $role->name,
+            'slug' => $role->slug,
+            'permissions' => $role->permissions->pluck('slug')->toArray(),
+        ]);
+
+        return redirect()->back()->with('success', 'Role ' . $role->name . ' created successfully.');
+    }
+
+    public function rolesUpdate(Request $request, \App\Models\Role $role)
+    {
+        if (!$request->user()->hasPermission('roles.manage') && !$request->user()->hasPermission('roles.view')) {
+            abort(403, 'Unauthorized action. Permission required: roles.manage');
+        }
+
+        // Protect Super Admin role from unauthorized non-super-admin updates
+        if ($role->slug === 'super-admin') {
+            $isSuperAdmin = $request->user()->roles()->where('slug', 'super-admin')->exists()
+                || ($request->user()->role === 'admin' && !$request->user()->roles()->exists());
+
+            if (!$isSuperAdmin) {
+                return redirect()->back()->with('error', 'Only Super Administrators can modify the Super Admin role.');
+            }
+        }
+
+        $data = $request->validate([
+            'name' => ['required', 'string', 'max:255'],
+            'description' => ['nullable', 'string', 'max:1000'],
+            'is_active' => ['nullable', 'boolean'],
+            'permissions' => ['nullable', 'array'],
+            'permissions.*' => ['exists:permissions,id'],
+        ]);
+
+        $oldPermissions = $role->permissions->pluck('slug')->toArray();
+
+        $role->update([
+            'name' => $data['name'],
+            'description' => $data['description'] ?? null,
+            'is_active' => $request->has('is_active'),
+        ]);
+
+        // CRITICAL: Exact synchronization with selected permission IDs. Unchecked permissions are detached.
+        $selectedPermissions = $data['permissions'] ?? [];
+        $role->permissions()->sync($selectedPermissions);
+
+        // Invalidate permission cache so changes take effect immediately across all active user sessions
+        \Illuminate\Support\Facades\Cache::forget("role_permissions_{$role->id}");
+
+        $newPermissions = $role->fresh()->permissions->pluck('slug')->toArray();
+
+        \App\Services\AuditLogger::log('role_permissions_updated', 'Role', (string) $role->id, null, [
+            'name' => $role->name,
+            'permissions' => $oldPermissions,
+        ], [
+            'name' => $role->name,
+            'permissions' => $newPermissions,
+        ]);
+
+        return redirect()->back()->with('success', 'Role ' . $role->name . ' updated successfully.');
+    }
+
+    public function rolesDelete(Request $request, \App\Models\Role $role)
+    {
+        if (!$request->user()->hasPermission('roles.manage') && !$request->user()->hasPermission('roles.view')) {
+            abort(403, 'Unauthorized action. Permission required: roles.manage');
+        }
+
+        if ($role->slug === 'super-admin') {
+            return redirect()->back()->with('error', 'The Super Admin role is protected and cannot be deleted.');
+        }
+
+        \App\Services\AuditLogger::log('role_deleted', 'Role', (string) $role->id, null, ['name' => $role->name], null);
+        
+        $role->permissions()->detach();
+        $role->users()->detach();
+        $role->delete();
+
+        return redirect()->back()->with('success', 'Role deleted successfully.');
+    }
+
+    public function assignUserPermissions(Request $request, User $user)
+    {
+        if (!$request->user()->hasPermission('users.assign_permissions') && !$request->user()->hasPermission('users.assign_roles') && !$request->user()->hasPermission('roles.manage') && !$request->user()->hasPermission('roles.view')) {
+            abort(403, 'Unauthorized action. Permission required: users.assign_permissions');
+        }
+
+        $data = $request->validate([
+            'roles' => ['nullable', 'array'],
+            'roles.*' => ['exists:roles,id'],
+            'direct_permissions' => ['nullable', 'array'],
+            'direct_permissions.*' => ['exists:permissions,id'],
+        ]);
+
+        $oldRoles = $user->roles->pluck('name')->toArray();
+        $oldDirectPerms = $user->directPermissions->pluck('slug')->toArray();
+
+        $user->roles()->sync($data['roles'] ?? []);
+        $user->directPermissions()->sync($data['direct_permissions'] ?? []);
+
+        // Also update legacy role column if assigning standard staff/admin roles
+        if (!empty($data['roles'])) {
+            $firstRole = \App\Models\Role::find($data['roles'][0]);
+            if ($firstRole && in_array($firstRole->slug, ['super-admin', 'administrator', 'service-manager', 'application-officer', 'document-verification-officer', 'finance-officer', 'customer-support', 'content-manager', 'email-manager', 'read-only-staff'])) {
+                $user->update(['role' => 'admin']);
+            }
+        }
+
+        \App\Services\AuditLogger::log('user_permissions_updated', 'User', (string) $user->id, null, [
+            'roles' => $oldRoles,
+            'direct_permissions' => $oldDirectPerms,
+        ], [
+            'roles' => $user->fresh()->roles->pluck('name')->toArray(),
+            'direct_permissions' => $user->fresh()->directPermissions->pluck('slug')->toArray(),
+        ]);
+
+        return redirect()->back()->with('success', 'User roles and direct permissions updated for ' . $user->name);
+    }
+
+    // --- Staff Work Queue ---
+    public function workQueue(Request $request)
+    {
+        $user = auth()->user();
+        $roleIds = $user->roles->pluck('id')->toArray();
+
+        $query = ServiceRequest::with(['client', 'service', 'currentStage', 'assignedStaff', 'assignedRole'])
+            ->latest();
+
+        // If not super_admin / manager, scope to user's assigned work
+        if (!$user->hasPermission('applications.update') && $user->role !== 'admin' && $user->role !== 'super_admin') {
+            $query->where(function ($q) use ($user, $roleIds) {
+                $q->where('assigned_staff_id', $user->id);
+                if (!empty($roleIds)) {
+                    $q->orWhereIn('assigned_role_id', $roleIds);
+                }
+            });
+        }
+
+        if ($search = $request->query('search')) {
+            $query->where(function ($q) use ($search) {
+                $q->where('reference_number', 'like', "%{$search}%")
+                  ->orWhere('client_name', 'like', "%{$search}%")
+                  ->orWhere('client_email', 'like', "%{$search}%")
+                  ->orWhere('service_name', 'like', "%{$search}%");
+            });
+        }
+
+        if ($statusFilter = $request->query('status')) {
+            $query->where('status', $statusFilter);
+        }
+
+        $myTasks = $query->paginate(15)->withQueryString();
+        $pendingDocVerifications = RequestDocument::where('status', 'Pending')->count();
+
+        return view('admin.work-queue', compact('myTasks', 'pendingDocVerifications'));
+    }
+
+    public function processWorkQueue(ServiceRequest $serviceRequest)
+    {
+        $serviceRequest->load([
+            'client',
+            'service.workflowStages',
+            'subService',
+            'requestDocuments',
+            'currentStage',
+            'stageHistories.changedBy',
+            'notes.user',
+            'assignmentHistories.previousStaff',
+            'assignmentHistories.newStaff',
+            'assignmentHistories.assignedBy'
+        ]);
+
+        $user = auth()->user();
+        \App\Services\AuditLogger::log(
+            'application_inspected_work_queue',
+            'ServiceRequest',
+            (string) $serviceRequest->id,
+            $serviceRequest->reference_number,
+            null,
+            ['staff_file_number' => $user->staff_file_number]
+        );
+
+        $workflowStages = $serviceRequest->service?->workflowStages()->orderBy('sort_order', 'asc')->get() ?? collect();
+        $staffMembers = User::where('role', '!=', 'client')->orderBy('first_name')->get();
+
+        return view('admin.work-queue-process', compact('serviceRequest', 'workflowStages', 'staffMembers'));
+    }
+
+    public function updateWorkQueueStatus(Request $request, ServiceRequest $serviceRequest)
+    {
+        $data = $request->validate([
+            'status' => ['required', Rule::in([
+                'Draft', 'In Progress', 'Application Submitted', 'Awaiting Assignment',
+                'Assigned', 'Payment Confirmed', 'Documents Under Review', 
+                'Verification in Progress', 'Processing', 'Awaiting External Agency', 
+                'Action Required', 'Escalated', 'Returned', 'Ready for Collection', 
+                'Completed', 'Cancelled', 'Rejected'
+            ])],
+            'stage_id' => ['nullable', 'exists:service_workflow_stages,id'],
+            'admin_notes' => ['nullable', 'string', 'max:2000'],
+            'is_user_visible' => ['nullable', 'boolean'],
+            'assigned_staff_id' => ['nullable', 'exists:users,id'],
+        ]);
+
+        $oldStatus = $serviceRequest->status;
+        $oldStaffId = $serviceRequest->assigned_staff_id;
+        $user = auth()->user();
+
+        $updateData = [
+            'status' => $data['status'],
+        ];
+
+        if (!empty($data['assigned_staff_id']) && $data['assigned_staff_id'] != $oldStaffId) {
+            $updateData['assigned_staff_id'] = $data['assigned_staff_id'];
+            $updateData['assigned_at'] = now();
+
+            \App\Models\AssignmentHistory::create([
+                'service_request_id' => $serviceRequest->id,
+                'previous_staff_id' => $oldStaffId,
+                'new_staff_id' => $data['assigned_staff_id'],
+                'assigned_by_id' => $user->id,
+                'notes' => 'Reassigned during work queue processing.',
+                'assigned_at' => now(),
+            ]);
+        }
+
+        if (!empty($data['stage_id'])) {
+            $stage = \App\Models\ServiceWorkflowStage::find($data['stage_id']);
+            if ($stage) {
+                $updateData['current_stage_id'] = $stage->id;
+                $updateData['current_stage_name'] = $stage->stage_name;
+            }
+        }
+
+        $serviceRequest->update($updateData);
+
+        $isPublic = $request->has('is_user_visible');
+
+        // Record Stage History
+        \App\Models\ApplicationStageHistory::create([
+            'service_request_id' => $serviceRequest->id,
+            'stage_id' => $serviceRequest->current_stage_id,
+            'stage_name' => $serviceRequest->current_stage_name ?? $serviceRequest->status,
+            'status' => $serviceRequest->status,
+            'changed_by_user_id' => $user->id,
+            'notes' => $data['admin_notes'] ?? null,
+            'is_user_visible' => $isPublic,
+        ]);
+
+        // Record Application Note
+        if (!empty($data['admin_notes'])) {
+            \App\Models\ApplicationNote::create([
+                'service_request_id' => $serviceRequest->id,
+                'user_id' => $user->id,
+                'note' => $data['admin_notes'],
+                'is_internal' => !$isPublic,
+            ]);
+        }
+
+        // Record Audit Log with Staff File Number
+        \App\Services\AuditLogger::log(
+            'application_status_updated_work_queue',
+            'ServiceRequest',
+            (string) $serviceRequest->id,
+            $serviceRequest->reference_number,
+            ['status' => $oldStatus],
+            [
+                'status' => $serviceRequest->status,
+                'staff_file_number' => $user->staff_file_number,
+                'notes' => $data['admin_notes'] ?? null,
+                'is_user_visible' => $isPublic
+            ]
+        );
+
+        // Send Email Notification to Client if visible
+        if ($isPublic && $serviceRequest->client_email) {
+            \App\Services\EmailNotificationService::send(
+                'stage_updated_user',
+                $serviceRequest->client_email,
+                [
+                    'full_name' => $serviceRequest->client_name,
+                    'service_name' => $serviceRequest->service_name,
+                    'reference_number' => $serviceRequest->reference_number,
+                    'current_stage' => $serviceRequest->current_stage_name ?? $serviceRequest->status,
+                    'status' => $serviceRequest->status,
+                    'notes' => !empty($data['admin_notes']) ? "<p><strong>Notes from Officer:</strong> " . e($data['admin_notes']) . "</p>" : '',
+                ],
+                $serviceRequest,
+                $serviceRequest->client
+            );
+        }
+
+        return redirect()->back()->with('success', "Application status updated to '{$serviceRequest->status}'. Audit log created under Staff File #{$user->staff_file_number}.");
+    }
+
+    public function verifyWorkQueueDocument(Request $request, RequestDocument $document)
+    {
+        $data = $request->validate([
+            'status' => ['required', Rule::in(['Pending', 'Received', 'Accepted', 'Requires Correction', 'Rejected'])],
+            'admin_notes' => ['nullable', 'string', 'max:1000'],
+        ]);
+
+        $oldStatus = $document->status;
+        $document->update([
+            'status' => $data['status'],
+            'admin_notes' => $data['admin_notes'] ?? $document->admin_notes,
+        ]);
+
+        $user = auth()->user();
+        \App\Services\AuditLogger::log(
+            'document_verified_work_queue',
+            'RequestDocument',
+            (string) $document->id,
+            $document->document_name,
+            ['status' => $oldStatus],
+            ['status' => $document->status, 'staff_file_number' => $user->staff_file_number, 'notes' => $data['admin_notes'] ?? null]
+        );
+
+        return redirect()->back()->with('success', "Document '{$document->document_name}' marked as {$data['status']}.");
+    }
+
+    // --- Email Template Management ---
+    public function emailTemplates()
+    {
+        $templates = \App\Models\EmailTemplate::all();
+        return view('admin.email-templates', compact('templates'));
+    }
+
+    public function updateEmailTemplate(Request $request, \App\Models\EmailTemplate $template)
+    {
+        $data = $request->validate([
+            'subject' => ['required', 'string', 'max:255'],
+            'body_html' => ['required', 'string'],
+            'is_active' => ['nullable', 'boolean'],
+        ]);
+
+        $oldVal = $template->toArray();
+        $template->update([
+            'subject' => $data['subject'],
+            'body_html' => $data['body_html'],
+            'is_active' => $request->has('is_active'),
+        ]);
+
+        \App\Services\AuditLogger::log('email_template_updated', 'EmailTemplate', (string) $template->id, null, $oldVal, $template->toArray());
+
+        return redirect()->back()->with('success', 'Email template (' . $template->title . ') updated successfully.');
+    }
+
+    // --- Audit Logs View ---
+    public function auditLogs(Request $request)
+    {
+        $query = \App\Models\AuditLog::with('user')->latest();
+
+        if ($search = $request->query('search')) {
+            $query->where(function ($q) use ($search) {
+                $q->where('user_name', 'like', "%{$search}%")
+                  ->orWhere('action', 'like', "%{$search}%")
+                  ->orWhere('reference_number', 'like', "%{$search}%");
+            });
+        }
+
+        $logs = $query->paginate(25)->withQueryString();
+
+        return view('admin.audit-logs', compact('logs'));
+    }
+
+    // --- Service Document Checklists ---
+    public function serviceDocuments(Request $request)
+    {
+        $services = Service::latest()->get();
+
+        $selectedService = null;
+        if ($serviceId = $request->query('service_id')) {
+            $selectedService = Service::find($serviceId);
+        }
+        if (!$selectedService && $services->isNotEmpty()) {
+            $selectedService = $services->first();
+        }
+
+        $documentTypes = DocumentType::latest()->get()->groupBy(function ($type) {
+            return $type->category ?: 'General';
+        });
+
+        return view('admin.service-documents', compact('services', 'selectedService', 'documentTypes'));
+    }
+
+    public function updateServiceDocuments(Request $request, Service $service)
+    {
+        $data = $request->validate([
+            'required_documents' => ['nullable', 'array'],
+            'required_documents.*' => ['string'],
+            'compulsory_docs' => ['nullable', 'array'],
+            'compulsory_docs.*' => ['string'],
+        ]);
+
+        $selectedDocs = $data['required_documents'] ?? [];
+        $compulsoryDocs = $data['compulsory_docs'] ?? [];
+
+        $structuredList = [];
+        foreach ($selectedDocs as $docName) {
+            $isCompulsory = in_array($docName, $compulsoryDocs, true);
+            $structuredList[] = [
+                'name' => $docName,
+                'is_compulsory' => $isCompulsory,
+            ];
+        }
+
+        $service->update([
+            'required_documents' => $structuredList,
+        ]);
+
+        return redirect()->back()->with('success', 'Required documents checklist updated for ' . $service->name . '.');
+    }
+
+    // --- Master Document Requirement Types ---
+    public function documentTypes(Request $request)
+    {
+        $documentTypes = DocumentType::latest()->get();
+        $allServices = Service::latest()->get();
+
+        return view('admin.document-types', compact('documentTypes', 'allServices'));
+    }
+
+    public function storeDocumentType(Request $request)
+    {
+        $data = $request->validate([
+            'name' => ['required', 'string', 'max:255', 'unique:document_types,name'],
+            'category' => ['required', 'string', 'max:255'],
+            'description' => ['nullable', 'string'],
+        ]);
+
+        $data['is_active'] = true;
+
+        $docType = DocumentType::create($data);
+
+        \App\Services\AuditLogger::log('document_type_created', 'DocumentType', (string) $docType->id, null, null, $docType->toArray());
+
+        return redirect()->back()->with('success', 'Master document type "' . $docType->name . '" created successfully.');
+    }
+
+    public function updateDocumentType(Request $request, DocumentType $documentType)
+    {
+        $data = $request->validate([
+            'name' => ['required', 'string', 'max:255', Rule::unique('document_types', 'name')->ignore($documentType->id)],
+            'category' => ['required', 'string', 'max:255'],
+            'description' => ['nullable', 'string'],
+            'is_active' => ['nullable', 'boolean'],
+        ]);
+
+        $oldVal = $documentType->toArray();
+        $documentType->update([
+            'name' => $data['name'],
+            'category' => $data['category'],
+            'description' => $data['description'] ?? null,
+            'is_active' => $request->has('is_active'),
+        ]);
+
+        \App\Services\AuditLogger::log('document_type_updated', 'DocumentType', (string) $documentType->id, null, $oldVal, $documentType->toArray());
+
+        return redirect()->back()->with('success', 'Master document type "' . $documentType->name . '" updated successfully.');
+    }
+
+    public function assignDocumentToServices(Request $request, DocumentType $documentType)
+    {
+        $serviceIds = $request->input('service_ids', []);
+        $allServices = Service::all();
+        $targetDocName = trim($documentType->name);
+
+        foreach ($allServices as $service) {
+            $raw = $service->required_documents;
+            if (is_string($raw)) {
+                $raw = json_decode($raw, true) ?: [];
+            }
+            if (!is_array($raw)) {
+                $raw = [];
+            }
+
+            // Normalize existing documents while preserving structure and compulsory flag
+            $structuredDocs = [];
+            $existingIndex = -1;
+
+            foreach ($raw as $item) {
+                if (is_array($item)) {
+                    $name = trim((string)($item['name'] ?? ($item['document_name'] ?? '')));
+                    $isCompulsory = isset($item['is_compulsory']) ? (bool)$item['is_compulsory'] : true;
+                } else {
+                    $name = trim((string)$item);
+                    $isCompulsory = true;
+                }
+
+                if ($name === '') {
+                    continue;
+                }
+
+                $structuredDocs[] = [
+                    'name' => $name,
+                    'is_compulsory' => $isCompulsory,
+                ];
+
+                if (strcasecmp($name, $targetDocName) === 0) {
+                    $existingIndex = count($structuredDocs) - 1;
+                }
+            }
+
+            $shouldHave = in_array((string) $service->id, array_map('strval', $serviceIds), true);
+
+            if ($shouldHave) {
+                if ($existingIndex === -1) {
+                    $structuredDocs[] = [
+                        'name' => $targetDocName,
+                        'is_compulsory' => true,
+                    ];
+                }
+            } else {
+                if ($existingIndex !== -1) {
+                    unset($structuredDocs[$existingIndex]);
+                    $structuredDocs = array_values($structuredDocs);
+                }
+            }
+
+            $service->update(['required_documents' => $structuredDocs]);
+        }
+
+        return redirect()->back()->with('success', 'Service assignments updated for document type "' . $documentType->name . '".');
+    }
+
+    public function deleteDocumentType(DocumentType $documentType)
+    {
+        $oldVal = $documentType->toArray();
+        $docName = $documentType->name;
+        $documentType->delete();
+
+        \App\Services\AuditLogger::log('document_type_deleted', 'DocumentType', (string) $documentType->id, null, $oldVal, null);
+
+        return redirect()->back()->with('success', 'Master document type "' . $docName . '" deleted successfully.');
+    }
+
+    /**
+     * Credo Direct Payment Verification & Re-query List View.
+     */
+    public function paymentVerification(Request $request)
+    {
+        $query = ServiceRequest::with(['service', 'client'])->latest();
+
+        if ($request->filled('search')) {
+            $search = trim($request->input('search'));
+            $query->where(function ($q) use ($search) {
+                $q->where('reference_number', 'like', "%{$search}%")
+                  ->orWhere('payment_reference', 'like', "%{$search}%")
+                  ->orWhere('client_name', 'like', "%{$search}%")
+                  ->orWhere('client_email', 'like', "%{$search}%");
+            });
+        }
+
+        if ($request->filled('status_filter')) {
+            $statusFilter = $request->input('status_filter');
+            if ($statusFilter === 'unpaid') {
+                $query->where(function ($q) {
+                    $q->where('payment_status', 'Unpaid')
+                      ->orWhere('payment_status', 'Pending');
+                });
+            } elseif ($statusFilter === 'paid') {
+                $query->where('payment_status', 'Paid');
+            }
+        }
+
+        $requests = $query->paginate(20)->withQueryString();
+        $search = $request->input('search', '');
+        $statusFilter = $request->input('status_filter', '');
+
+        return view('admin.payment-verification', compact('requests', 'search', 'statusFilter'));
+    }
+
+    /**
+     * Re-query Credo API directly for a specific transaction reference.
+     */
+    public function queryCredoPayment(Request $request)
+    {
+        $user = auth()->user();
+        if (!$user || (!$user->hasPermission('applications.update') && !$user->hasPermission('applications.status.update') && !$user->hasPermission('services.pricing.update'))) {
+            return redirect()->back()->with('error', 'Access Denied: Your assigned role does not have permission to re-query transactions.');
+        }
+
+        $data = $request->validate([
+            'reference' => ['required', 'string', 'max:255'],
+        ]);
+
+        $reference = trim($data['reference']);
+
+        $serviceRequest = ServiceRequest::where('reference_number', $reference)
+            ->orWhere('payment_reference', $reference)
+            ->orWhere('id', $reference)
+            ->first();
+
+        if (!$serviceRequest) {
+            return redirect()->back()->with('error', "No application found matching reference '{$reference}'.");
+        }
+
+        $refToQuery = $serviceRequest->payment_reference ?: $serviceRequest->reference_number;
+
+        $paystackService = new \App\Services\PaystackService();
+        $credoService = new \App\Services\CredoService();
+
+        // 1. Query Paystack API
+        $paystackRes = $paystackService->verifyTransaction($refToQuery);
+        $paystackOk = !empty($paystackRes['is_successful']);
+
+        // 2. Query Credo API
+        $credoRes = $credoService->verifyTransaction($refToQuery);
+        $credoOk = !empty($credoRes['is_successful']);
+
+        // Fallback check: If payment_reference was different from reference_number, test reference_number as well
+        if (!$paystackOk && !$credoOk && $serviceRequest->payment_reference && $serviceRequest->payment_reference !== $serviceRequest->reference_number) {
+            $altRef = $serviceRequest->reference_number;
+            $paystackResAlt = $paystackService->verifyTransaction($altRef);
+            if (!empty($paystackResAlt['is_successful'])) {
+                $paystackRes = $paystackResAlt;
+                $paystackOk = true;
+            } else {
+                $credoResAlt = $credoService->verifyTransaction($altRef);
+                if (!empty($credoResAlt['is_successful'])) {
+                    $credoRes = $credoResAlt;
+                    $credoOk = true;
+                }
+            }
+        }
+
+        // Handle SUCCESSFUL verification on either gateway
+        if ($paystackOk || $credoOk) {
+            $usedGateway = $paystackOk ? 'Paystack' : 'Credo';
+
+            $serviceRequest->update([
+                'payment_status' => 'Paid',
+                'amount_paid' => $serviceRequest->price,
+                'outstanding_balance' => 0,
+                'status' => 'Payment Confirmed',
+                'payment_gateway' => $usedGateway,
+            ]);
+
+            $serviceRequest->syncStatusToWorkflowStage('Payment Confirmed', "Payment verified directly via {$usedGateway} Gateway API by Admin.");
+
+            \App\Services\AuditLogger::log(
+                'payment_verified',
+                'ServiceRequest',
+                (string) $serviceRequest->id,
+                $serviceRequest->reference_number,
+                ['old_status' => $serviceRequest->getOriginal('status'), 'old_payment_status' => $serviceRequest->getOriginal('payment_status')],
+                ['payment_status' => 'Paid', 'status' => 'Payment Confirmed', 'payment_gateway' => $usedGateway]
+            );
+
+            return redirect()->back()->with('success', "{$usedGateway} Verification SUCCESSFUL! Payment confirmed for application {$serviceRequest->reference_number}. Database record updated to Paid & Payment Confirmed.");
+        }
+
+        // Handle UNSUCCESSFUL verification on both gateways
+        $paystackMsg = $paystackRes['message'] ?? 'Transaction reference not found on Paystack.';
+        $credoMsg = $credoRes['message'] ?? 'Transaction reference not found on Credo.';
+
+        // Always update database record to Unpaid / Payment Pending because gateway API verification failed
+        $serviceRequest->update([
+            'payment_status' => 'Unpaid',
+            'amount_paid' => 0,
+            'outstanding_balance' => $serviceRequest->price,
+            'status' => 'Payment Pending',
+        ]);
+
+        $serviceRequest->syncStatusToWorkflowStage('Payment Pending', 'Payment status updated to Unpaid after gateway API re-query failed to confirm payment.');
+
+        \App\Services\AuditLogger::log(
+            'payment_unconfirmed_updated',
+            'ServiceRequest',
+            (string) $serviceRequest->id,
+            $serviceRequest->reference_number,
+            ['old_status' => $serviceRequest->getOriginal('status'), 'old_payment_status' => $serviceRequest->getOriginal('payment_status')],
+            ['payment_status' => 'Unpaid', 'status' => 'Payment Pending']
+        );
+
+        return redirect()->back()->with('error', "Gateway API Verification FAILED! Neither Paystack nor Credo confirmed payment for '{$refToQuery}'. Database record has been UPDATED to Unpaid / Payment Pending. Details: [Paystack: {$paystackMsg}] | [Credo: {$credoMsg}]");
+    }
+
+    /**
+     * Admin Profile View.
+     */
+    public function profile()
+    {
+        $user = auth()->user();
+        return view('admin.profile', compact('user'));
+    }
+
+    /**
+     * Update Admin Profile.
+     */
+    public function updateProfile(Request $request)
+    {
+        $user = auth()->user();
+
+        $data = $request->validate([
+            'first_name' => ['required', 'string', 'max:255'],
+            'last_name' => ['required', 'string', 'max:255'],
+            'email' => ['required', 'email', 'max:255', Rule::unique('users', 'email')->ignore($user->id)],
+            'phone' => ['nullable', 'string', 'max:50'],
+            'country' => ['nullable', 'string', 'max:255'],
+            'state' => ['nullable', 'string', 'max:255'],
+            'avatar' => ['nullable', 'image', 'mimes:png,jpg,jpeg,webp', 'max:5120'],
+        ]);
+
+        if ($request->hasFile('avatar')) {
+            $path = \App\Helpers\FileUploadHelper::store($request->file('avatar'), 'uploads');
+            $data['avatar_url'] = '/storage/' . $path;
+        }
+
+        $data['name'] = trim($data['first_name'] . ' ' . $data['last_name']);
+
+        $user->update($data);
+
+        \App\Services\AuditLogger::log('admin_profile_updated', 'User', (string) $user->id, $user->name, null, $data);
+
+        return redirect()->back()->with('success', 'Admin profile updated successfully.');
+    }
+
+    /**
+     * Update Admin Password.
+     */
+    public function updatePassword(Request $request)
+    {
+        $user = auth()->user();
+
+        $data = $request->validate([
+            'current_password' => ['required', 'string'],
+            'new_password' => ['required', 'string', 'min:8', 'confirmed'],
+        ]);
+
+        if (!\Hash::check($data['current_password'], $user->password)) {
+            return redirect()->back()->withErrors(['current_password' => 'The current password entered is incorrect.']);
+        }
+
+        $user->update([
+            'password' => \Hash::make($data['new_password']),
+        ]);
+
+        \App\Services\AuditLogger::log('admin_password_updated', 'User', (string) $user->id, $user->name, null, null);
+
+        return redirect()->back()->with('success', 'Password updated successfully!');
+    }
+
+    /**
+     * Display Email Broadcast Composer page.
+     */
+    public function emailBroadcast()
+    {
+        $users = User::orderBy('first_name')->get(['id', 'first_name', 'last_name', 'email', 'role']);
+        return view('admin.email-broadcast', compact('users'));
+    }
+
+    /**
+     * Process & Send Broadcast Email.
+     */
+    public function sendEmailBroadcast(Request $request)
+    {
+        $request->validate([
+            'notice_category' => ['required', Rule::in(['maintenance', 'announcement', 'service_update', 'custom'])],
+            'recipient_target' => ['required', Rule::in(['all_clients', 'all_vendors', 'all_users', 'specific_user', 'external_emails'])],
+            'specific_user_id' => ['required_if:recipient_target,specific_user', 'nullable', 'exists:users,id'],
+            'external_emails' => ['required_if:recipient_target,external_emails', 'nullable', 'string'],
+            'email_subject' => ['required', 'string', 'max:255'],
+            'email_headline' => ['nullable', 'string', 'max:255'],
+            'email_body' => ['required', 'string'],
+            'button_text' => ['nullable', 'string', 'max:100'],
+            'button_url' => ['nullable', 'url', 'max:255'],
+        ]);
+
+        $recipients = [];
+
+        switch ($request->recipient_target) {
+            case 'all_clients':
+                $recipients = User::where('role', 'client')->get();
+                break;
+
+            case 'all_vendors':
+                $recipients = User::where('role', 'vendor')->get();
+                break;
+
+            case 'all_users':
+                $recipients = User::whereIn('role', ['client', 'vendor', 'admin', 'manager', 'processing_officer', 'super_admin'])->get();
+                break;
+
+            case 'specific_user':
+                $user = User::find($request->specific_user_id);
+                if ($user) {
+                    $recipients = [$user];
+                }
+                break;
+
+            case 'external_emails':
+                $rawEmails = array_map('trim', explode(',', $request->external_emails));
+                foreach ($rawEmails as $email) {
+                    if (filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                        $recipients[] = (object) [
+                            'email' => $email,
+                            'name' => explode('@', $email)[0],
+                            'first_name' => explode('@', $email)[0],
+                            'id' => null
+                        ];
+                    }
+                }
+                break;
+        }
+
+        if (empty($recipients)) {
+            return redirect()->back()->with('error', 'No valid recipient email addresses found for the selected target group.')->withInput();
+        }
+
+        $settings = SystemSetting::first();
+        $companyName = $settings->platform_name ?? 'DOOTOR ENTERPRISES';
+        $logoUrl = $settings->logo_url ? app_file_url($settings->logo_url) : null;
+
+        $sentCount = 0;
+        $failedCount = 0;
+
+        foreach ($recipients as $recipient) {
+            $userObj = is_a($recipient, User::class) ? $recipient : null;
+            $recipientEmail = is_a($recipient, User::class) ? $recipient->email : $recipient->email;
+            $recipientName = is_a($recipient, User::class) ? ($recipient->first_name . ' ' . $recipient->last_name) : $recipient->name;
+
+            // Render email body template
+            $renderedHtml = view('emails.broadcast', [
+                'category' => $request->notice_category,
+                'subject' => $request->email_subject,
+                'headline' => $request->email_headline ?? $request->email_subject,
+                'bodyContent' => $request->email_body,
+                'buttonText' => $request->button_text,
+                'buttonUrl' => $request->button_url,
+                'recipientName' => $recipientName,
+                'companyName' => $companyName,
+                'logoUrl' => $logoUrl,
+            ])->render();
+
+            $success = \App\Services\EmailNotificationService::sendBroadcast(
+                $recipientEmail,
+                $request->email_subject,
+                $renderedHtml,
+                $userObj
+            );
+
+            if ($success) {
+                $sentCount++;
+            } else {
+                $failedCount++;
+            }
+        }
+
+        \App\Services\AuditLogger::log('broadcast_email_sent', 'EmailLog', null, "Category: {$request->notice_category}", null, [
+            'sent_count' => $sentCount,
+            'failed_count' => $failedCount,
+            'subject' => $request->email_subject,
+            'target' => $request->recipient_target,
+        ]);
+
+        $msg = "Broadcast notice dispatched successfully to {$sentCount} recipient(s).";
+        if ($failedCount > 0) {
+            $msg .= " ({$failedCount} failed to deliver)";
+        }
+
+        return redirect()->back()->with('success', $msg);
+    }
+
+    /**
+     * Display Application Expirations and Halfway Incomplete Applications Management.
+     */
+    public function expirations(Request $request)
+    {
+        $user = auth()->user();
+        if (!$user || (!$user->isAdmin() && !$user->hasPermission('applications.view'))) {
+            return redirect()->route('admin.dashboard')->with('error', 'Access Denied: You do not have permission to view application expirations.');
+        }
+
+        $activeTab = $request->input('tab', 'drafts'); // 'drafts' or 'paid'
+        $search = trim($request->input('search', ''));
+        $statusFilter = $request->input('status_filter', 'all'); // 'all', 'expired', 'expiring_soon', 'active'
+
+        $stats = ApplicationExpirationService::getDashboardStats();
+        $settings = $stats['settings'];
+
+        if ($activeTab === 'paid') {
+            $query = ApplicationExpirationService::getPaidIncompleteQuery();
+            $cutoff = ApplicationExpirationService::getPaidIncompleteCutoff();
+            $warningCutoff = $settings['paid_incomplete_expiry_unit'] === 'months'
+                ? \Carbon\Carbon::now()->subMonths($settings['paid_incomplete_expiry_value'])->addDays(7)
+                : \Carbon\Carbon::now()->subDays($settings['paid_incomplete_expiry_value'])->addDays(7);
+        } else {
+            $query = ApplicationExpirationService::getUnfinishedDraftsQuery();
+            $cutoff = ApplicationExpirationService::getDraftCutoff();
+            $warningCutoff = $settings['draft_expiry_unit'] === 'months'
+                ? \Carbon\Carbon::now()->subMonths($settings['draft_expiry_value'])->addDays(5)
+                : \Carbon\Carbon::now()->subDays($settings['draft_expiry_value'])->addDays(5);
+        }
+
+        if (!empty($search)) {
+            $query->where(function ($q) use ($search) {
+                $q->where('reference_number', 'like', "%{$search}%")
+                  ->orWhere('client_name', 'like', "%{$search}%")
+                  ->orWhere('client_email', 'like', "%{$search}%")
+                  ->orWhere('service_name', 'like', "%{$search}%")
+                  ->orWhere('sub_service_name', 'like', "%{$search}%");
+            });
+        }
+
+        if ($statusFilter === 'expired') {
+            $query->where(DB::raw('COALESCE(last_saved_at, updated_at, created_at)'), '<=', $cutoff);
+        } elseif ($statusFilter === 'expiring_soon') {
+            $query->where(DB::raw('COALESCE(last_saved_at, updated_at, created_at)'), '>', $cutoff)
+                  ->where(DB::raw('COALESCE(last_saved_at, updated_at, created_at)'), '<=', $warningCutoff);
+        } elseif ($statusFilter === 'active') {
+            $query->where(DB::raw('COALESCE(last_saved_at, updated_at, created_at)'), '>', $warningCutoff);
+        }
+
+        $applications = $query->orderBy(DB::raw('COALESCE(last_saved_at, updated_at, created_at)'), 'asc')
+            ->paginate(15)
+            ->withQueryString();
+
+        // Annotate each model with calculated expiry dates and countdown badges
+        $applications->getCollection()->transform(function ($app) use ($activeTab) {
+            return ApplicationExpirationService::annotateApplication($app, $activeTab === 'paid' ? 'paid' : 'draft');
+        });
+
+        return view('admin.expirations', compact(
+            'applications',
+            'stats',
+            'settings',
+            'activeTab',
+            'search',
+            'statusFilter'
+        ));
+    }
+
+    /**
+     * Update dynamic application expiration settings (thresholds in days or months).
+     */
+    public function updateExpirationSettings(Request $request)
+    {
+        $user = auth()->user();
+        if (!$user || (!$user->isAdmin() && !$user->hasPermission('settings.view'))) {
+            return redirect()->back()->with('error', 'Access Denied: You do not have permission to modify expiration settings.');
+        }
+
+        $data = $request->validate([
+            'draft_expiry_value' => ['required', 'integer', 'min:1', 'max:365'],
+            'draft_expiry_unit' => ['required', Rule::in(['days', 'months'])],
+            'paid_incomplete_expiry_value' => ['required', 'integer', 'min:1', 'max:365'],
+            'paid_incomplete_expiry_unit' => ['required', Rule::in(['days', 'months'])],
+            'auto_purge_enabled' => ['required', 'boolean'],
+            'purge_action' => ['required', Rule::in(['delete', 'mark_expired'])],
+        ]);
+
+        $settings = SystemSetting::firstOrCreate([]);
+        $settings->update($data);
+
+        \App\Services\AuditLogger::log(
+            'expiration_policy_updated',
+            'SystemSetting',
+            (string) $settings->id,
+            null,
+            null,
+            $data
+        );
+
+        return redirect()->back()->with('success', 'Application expiration policy settings have been successfully updated.');
+    }
+
+    /**
+     * Run on-demand batch purge for expired applications.
+     */
+    public function runExpirationPurge(Request $request)
+    {
+        $user = auth()->user();
+        if (!$user || (!$user->isAdmin() && !$user->hasPermission('applications.delete') && !$user->hasPermission('settings.view'))) {
+            return redirect()->back()->with('error', 'Access Denied: You do not have permission to purge applications.');
+        }
+
+        $action = $request->input('action');
+        $results = ApplicationExpirationService::purgeAllExpired($action);
+
+        $actionWord = ($action === 'mark_expired') ? 'marked as expired' : 'permanently deleted';
+        $msg = "System Expiration Cleanup Completed: {$results['purged_drafts']} unfinished draft(s) and {$results['purged_paid']} paid incomplete application(s) were {$actionWord}. Total processed: {$results['total_purged']}.";
+
+        return redirect()->back()->with('success', $msg);
+    }
+
+    /**
+     * Immediately purge or delete a specific incomplete application.
+     */
+    public function deleteIncompleteApplication(ServiceRequest $serviceRequest)
+    {
+        $user = auth()->user();
+        if (!$user || (!$user->isAdmin() && !$user->hasPermission('applications.delete'))) {
+            return redirect()->back()->with('error', 'Access Denied: You do not have permission to delete applications.');
+        }
+
+        $ref = $serviceRequest->reference_number;
+        ApplicationExpirationService::purgeApplication($serviceRequest);
+
+        return redirect()->back()->with('success', "Application [{$ref}] and all associated files have been permanently removed.");
+    }
+
+    /**
+     * Comprehensive Traffic & Link Click Analytics
+     */
+    public function analytics(Request $request)
+    {
+        $totalVisits = \App\Models\AnalyticsEvent::where('event_type', 'page_view')->count();
+        $uniqueVisitors = \App\Models\AnalyticsEvent::distinct('ip_address')->count('ip_address');
+        $totalClicks = \App\Models\AnalyticsEvent::where('event_type', '!=', 'page_view')->count();
+        
+        $socialBreakdown = \App\Models\AnalyticsEvent::where('category', 'social')
+            ->selectRaw('label, count(*) as total')
+            ->groupBy('label')
+            ->orderByDesc('total')
+            ->get();
+
+        $serviceClicks = \App\Models\AnalyticsEvent::where('category', 'service')
+            ->selectRaw('label, count(*) as total')
+            ->groupBy('label')
+            ->orderByDesc('total')
+            ->take(10)
+            ->get();
+
+        // 7-day daily trend
+        $dailyTrend = \App\Models\AnalyticsEvent::where('created_at', '>=', now()->subDays(7))
+            ->selectRaw("DATE(created_at) as log_date, count(*) as total")
+            ->groupBy('log_date')
+            ->orderBy('log_date', 'asc')
+            ->pluck('total', 'log_date')
+            ->toArray();
+
+        $recentEvents = \App\Models\AnalyticsEvent::with('user')->latest()->take(20)->get();
+
+        return view('admin.analytics', compact(
+            'totalVisits',
+            'uniqueVisitors',
+            'totalClicks',
+            'socialBreakdown',
+            'serviceClicks',
+            'dailyTrend',
+            'recentEvents'
+        ));
+    }
+
+    /**
+     * IT Support, System Diagnostics & Server Health Desk
+     */
+    public function itSupport(Request $request)
+    {
+        $phpVersion = PHP_VERSION;
+        $laravelVersion = app()->version();
+        $serverSoftware = $_SERVER['SERVER_SOFTWARE'] ?? 'Apache/XAMPP';
+        $dbStatus = 'Connected';
+        try {
+            \Illuminate\Support\Facades\DB::connection()->getPdo();
+        } catch (\Throwable $e) {
+            $dbStatus = 'Disconnected: ' . $e->getMessage();
+        }
+
+        $logPath = storage_path('logs/laravel.log');
+        $logLines = [];
+        if (file_exists($logPath)) {
+            $file = file($logPath);
+            $logLines = array_slice($file, -40);
+        }
+
+        $diskFree = @disk_free_space(base_path());
+        $diskTotal = @disk_total_space(base_path());
+        $diskFreeMb = $diskFree ? round($diskFree / (1024 * 1024), 1) : 0;
+        $diskTotalMb = $diskTotal ? round($diskTotal / (1024 * 1024), 1) : 0;
+
+        return view('admin.it-support', compact(
+            'phpVersion',
+            'laravelVersion',
+            'serverSoftware',
+            'dbStatus',
+            'logLines',
+            'diskFreeMb',
+            'diskTotalMb'
+        ));
+    }
+
+    /**
+     * Clear system caches & run Laravel maintenance commands with one click
+     */
+    public function clearSystemCache(Request $request)
+    {
+        $action = $request->input('action', 'all');
+
+        switch ($action) {
+            case 'view':
+                \Illuminate\Support\Facades\Artisan::call('view:clear');
+                $msg = 'Compiled Blade views cleared (view:clear).';
+                break;
+            case 'cache':
+                \Illuminate\Support\Facades\Artisan::call('cache:clear');
+                $msg = 'Application cache cleared (cache:clear).';
+                break;
+            case 'config':
+                \Illuminate\Support\Facades\Artisan::call('config:clear');
+                $msg = 'Configuration cache cleared (config:clear).';
+                break;
+            case 'route':
+                \Illuminate\Support\Facades\Artisan::call('route:clear');
+                $msg = 'Route cache cleared (route:clear).';
+                break;
+            case 'migrate':
+                \Illuminate\Support\Facades\Artisan::call('migrate', ['--force' => true]);
+                $msg = 'Database migrations executed (migrate --force): ' . trim(\Illuminate\Support\Facades\Artisan::output());
+                break;
+            case 'storage_link':
+                \Illuminate\Support\Facades\Artisan::call('storage:link');
+                $msg = 'Storage symlink verified/created (storage:link).';
+                break;
+            case 'optimize':
+            case 'all':
+            default:
+                \Illuminate\Support\Facades\Artisan::call('optimize:clear');
+                \Illuminate\Support\Facades\Artisan::call('view:clear');
+                \Illuminate\Support\Facades\Artisan::call('cache:clear');
+                \Illuminate\Support\Facades\Artisan::call('config:clear');
+                \Illuminate\Support\Facades\Artisan::call('route:clear');
+                $msg = 'All Laravel caches (optimize:clear, view, cache, config & routes) have been purged successfully.';
+                break;
+        }
+
+        return redirect()->back()->with('success', $msg);
+    }
+
+    /**
+     * Client Reviews Management CRUD
+     */
+    public function reviewsIndex(Request $request)
+    {
+        $reviews = \App\Models\Review::with('user')->latest()->paginate(25);
+        $totalReviews = \App\Models\Review::count();
+        $pendingReviews = \App\Models\Review::where('is_approved', false)->count();
+        $averageRating = round(\App\Models\Review::avg('rating') ?? 5.0, 1);
+
+        return view('admin.reviews', compact('reviews', 'totalReviews', 'pendingReviews', 'averageRating'));
+    }
+
+    public function reviewsToggleApprove(\App\Models\Review $review)
+    {
+        $review->update(['is_approved' => !$review->is_approved]);
+        $status = $review->is_approved ? 'Approved' : 'Unapproved';
+        return redirect()->back()->with('success', "Review from {$review->client_name} marked as {$status}.");
+    }
+
+    public function reviewsToggleFeature(\App\Models\Review $review)
+    {
+        $review->update(['is_featured' => !$review->is_featured]);
+        $status = $review->is_featured ? 'Featured on Homepage' : 'Hidden from Homepage Featured';
+        return redirect()->back()->with('success', "Review from {$review->client_name} {$status}.");
+    }
+
+    public function reviewsDelete(\App\Models\Review $review)
+    {
+        $clientName = $review->client_name;
+        $review->delete();
+        return redirect()->back()->with('success', "Review by {$clientName} was deleted.");
+    }
+}
+
+

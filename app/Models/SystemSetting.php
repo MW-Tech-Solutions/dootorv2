@@ -1,0 +1,103 @@
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+
+class SystemSetting extends Model
+{
+    protected $fillable = [
+        'platform_name',
+        'company_name',
+        'logo_url',
+        'brand_template',
+        'brand_theme',
+        'brand_color_palette',
+        'brand_primary_color',
+        'brand_secondary_color',
+        'brand_gradient_from',
+        'brand_gradient_to',
+        'hero_badge_text',
+        'hero_title',
+        'hero_subtitle',
+        'hero_bg_image',
+        'hero_glass_style',
+        'default_currency',
+        'maintenance_mode',
+        'payment_gateway',
+        'payments_enabled',
+        'payment_mode',
+        'paystack_public_key',
+        'paystack_secret_key',
+        'paystack_base_url',
+        'credo_public_key',
+        'credo_secret_key',
+        'credo_base_url',
+        'paypal_client_id',
+        'paypal_client_secret',
+        'moneris_store_id',
+        'moneris_api_token',
+        'moneris_checkout_id',
+        'smtp_host',
+        'smtp_port',
+        'smtp_user',
+        'smtp_pass',
+        'smtp_encryption',
+        'smtp_sender_name',
+        'smtp_sender_email',
+        'template_vendor_approval',
+        'template_client_registration',
+        'template_payment_confirmation',
+        'template_service_update',
+        'terms_conditions',
+        'refund_policy',
+        'privacy_policy',
+        'facebook_url',
+        'twitter_url',
+        'instagram_url',
+        'linkedin_url',
+        'whatsapp_number',
+        'youtube_url',
+        'promo_video_url',
+        'promo_video_title',
+        'tiktok_url',
+        'contact_email',
+        'contact_phone',
+        'contact_address',
+        'draft_expiry_value',
+        'draft_expiry_unit',
+        'paid_incomplete_expiry_value',
+        'paid_incomplete_expiry_unit',
+        'auto_purge_enabled',
+        'purge_action',
+        'gemini_api_key',
+        'chatbot_enabled',
+        'chatbot_system_prompt',
+    ];
+
+    protected function casts(): array
+    {
+        return [
+            'maintenance_mode' => 'boolean',
+            'payments_enabled' => 'boolean',
+            'auto_purge_enabled' => 'boolean',
+            'chatbot_enabled' => 'boolean',
+            'draft_expiry_value' => 'integer',
+            'paid_incomplete_expiry_value' => 'integer',
+            'smtp_port' => 'integer',
+        ];
+    }
+
+    public function getCurrencySymbolAttribute(): string
+    {
+        $code = strtoupper((string) ($this->default_currency ?? config('services.payment.currency', 'USD')));
+        return match($code) {
+            'USD' => '$',
+            'NGN' => '₦',
+            'GBP' => '£',
+            'EUR' => '€',
+            'CAD' => 'CA$',
+            default => '$',
+        };
+    }
+}
