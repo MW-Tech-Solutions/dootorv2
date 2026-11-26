@@ -135,6 +135,24 @@
                 <p class="text-secondary small">Access your account to manage your document services</p>
             </div>
 
+            @if(session('error'))
+                <div class="alert alert-danger rounded-4 py-3 px-3.5 mb-4 d-flex align-items-start gap-2.5 shadow-sm border-0 bg-danger bg-opacity-10 text-danger" role="alert">
+                    <i class="bi bi-shield-lock-fill fs-5 flex-shrink-0 mt-0.5"></i>
+                    <div class="small">
+                        <div class="fw-bold mb-1">Access Restricted</div>
+                        {{ session('error') }}
+                        @if(session('show_staff_link'))
+                            <div class="mt-2.5">
+                                <a href="{{ route('staff.portal') }}" class="btn btn-sm btn-danger rounded-pill px-3 py-1 fw-bold text-decoration-none shadow-sm d-inline-flex align-items-center gap-1">
+                                    <span>Open Staff Portal</span>
+                                    <i class="bi bi-arrow-right"></i>
+                                </a>
+                            </div>
+                        @endif
+                    </div>
+                </div>
+            @endif
+
             <form action="{{ route('login') }}" method="POST">
                 @csrf
 
@@ -184,6 +202,12 @@
                 Don't have an account? <br class="d-none d-sm-block">
                 <a href="{{ route('register.client') }}" class="text-decoration-none text-brand-success fw-semibold">Register Account</a>
                 {{-- Vendor registration disabled for now: <a href="{{ route('register') }}" class="text-decoration-none text-brand-success ms-1">Join as Vendor</a> --}}
+            </div>
+
+            <div class="text-center mt-3 pt-2">
+                <a href="{{ route('staff.portal') }}" class="text-decoration-none small text-muted d-inline-flex align-items-center gap-1.5 fw-medium">
+                    <i class="bi bi-shield-lock text-success"></i> Are you a staff member? <span class="text-brand-success text-decoration-underline">Staff Login</span>
+                </a>
             </div>
         </div>
     </div>

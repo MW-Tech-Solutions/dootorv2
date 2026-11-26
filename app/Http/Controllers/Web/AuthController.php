@@ -36,6 +36,18 @@ class AuthController extends Controller
         $request->session()->regenerate();
         $user = Auth::user();
 
+        // Block Admin & Staff from using normal client login portal
+        if ($user->role === 'admin' || $user->isAdmin() || $user->roles()->exists()) {
+            Auth::logout();
+            $request->session()->invalidate();
+            $request->session()->regenerateToken();
+
+            return redirect()->route('login')
+                ->withInput(['email' => $credentials['email']])
+                ->with('error', 'Administrator and Staff accounts cannot sign in through the client portal. Please use the Staff Portal to log in.')
+                ->with('show_staff_link', true);
+        }
+
         if ($user->status === 'Disabled') {
             Auth::logout();
             $request->session()->invalidate();
