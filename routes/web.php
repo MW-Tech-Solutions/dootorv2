@@ -251,6 +251,8 @@ Route::middleware('auth')->group(function () {
         Route::middleware('permission:settings.view')->group(function () {
             Route::get('/settings', [AdminController::class, 'settings'])->name('admin.settings');
             Route::post('/settings', [AdminController::class, 'updateSettings'])->name('admin.settings.update');
+            Route::get('/adverts', [AdminController::class, 'adverts'])->name('admin.adverts');
+            Route::post('/adverts', [AdminController::class, 'updateAdverts'])->name('admin.adverts.update');
         });
 
         // FAQs Dynamic Management

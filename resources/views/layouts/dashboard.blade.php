@@ -37,6 +37,7 @@
                 ['href' => route('admin.reports'), 'icon' => 'bi-graph-up', 'label' => 'Reports & Analytics', 'permission' => 'reports.view'],
                 ['href' => route('admin.analytics'), 'icon' => 'bi-graph-up-arrow', 'label' => 'Traffic & Clicks Analytics', 'permission' => 'analytics.view'],
                 ['href' => route('admin.reviews'), 'icon' => 'bi-star-half', 'label' => 'Customer Reviews', 'permission' => 'reviews.manage'],
+                ['href' => route('admin.adverts'), 'icon' => 'bi-youtube', 'label' => 'YouTube & Adverts', 'permission' => 'settings.view'],
                 ['href' => route('admin.it-support'), 'icon' => 'bi-cpu', 'label' => 'IT Support & Health', 'permission' => 'it_support.view'],
                 ['href' => route('admin.live-chat'), 'icon' => 'bi-chat-dots', 'label' => 'Live Support Chat', 'permission' => 'live_chat.manage'],
                 ['href' => route('admin.proxy-booking'), 'icon' => 'bi-person-plus', 'label' => 'Quick Client & Request', 'permission' => 'applications.proxy_create'],

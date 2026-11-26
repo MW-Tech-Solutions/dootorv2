@@ -2124,6 +2124,29 @@ class AdminController extends Controller
         $review->delete();
         return redirect()->back()->with('success', "Review by {$clientName} was deleted.");
     }
+
+    /**
+     * YouTube & Promo Adverts Management
+     */
+    public function adverts()
+    {
+        $settings = SystemSetting::firstOrCreate([]);
+        return view('admin.adverts', compact('settings'));
+    }
+
+    public function updateAdverts(Request $request)
+    {
+        $data = $request->validate([
+            'promo_video_url' => ['nullable', 'string', 'max:500'],
+            'promo_video_title' => ['nullable', 'string', 'max:255'],
+            'youtube_url' => ['nullable', 'string', 'max:255'],
+        ]);
+
+        $settings = SystemSetting::firstOrCreate([]);
+        $settings->update($data);
+
+        return redirect()->back()->with('success', 'YouTube advert and video settings updated successfully! Live on homepage.');
+    }
 }
 
 
