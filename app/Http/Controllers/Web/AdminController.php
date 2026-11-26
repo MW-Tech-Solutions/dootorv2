@@ -320,6 +320,18 @@ class AdminController extends Controller
 
     public function storeService(Request $request)
     {
+        if ($request->file('image') && !$request->file('image')->isValid()) {
+            $err = $request->file('image')->getError();
+            $msg = match($err) {
+                UPLOAD_ERR_INI_SIZE, UPLOAD_ERR_FORM_SIZE => 'The uploaded image exceeds your server\'s PHP upload limit (upload_max_filesize). Please select an image under 2MB or increase upload_max_filesize in cPanel MultiPHP INI Editor.',
+                UPLOAD_ERR_PARTIAL => 'The image was only partially uploaded. Please check your network and try again.',
+                UPLOAD_ERR_NO_TMP_DIR => 'Missing a temporary upload directory on the server.',
+                UPLOAD_ERR_CANT_WRITE => 'Failed to write image to server disk. Check permissions.',
+                default => 'The image failed to upload (PHP Error: ' . $err . ').',
+            };
+            return redirect()->back()->withInput()->with('error', $msg);
+        }
+
         $data = $request->validate([
             'name' => ['required', 'string', 'max:255'],
             'parent_id' => ['nullable', 'exists:services,id'],
@@ -361,6 +373,18 @@ class AdminController extends Controller
 
     public function updateService(Request $request, Service $service)
     {
+        if ($request->file('image') && !$request->file('image')->isValid()) {
+            $err = $request->file('image')->getError();
+            $msg = match($err) {
+                UPLOAD_ERR_INI_SIZE, UPLOAD_ERR_FORM_SIZE => 'The uploaded image exceeds your server\'s PHP upload limit (upload_max_filesize). Please select an image under 2MB or increase upload_max_filesize in cPanel MultiPHP INI Editor.',
+                UPLOAD_ERR_PARTIAL => 'The image was only partially uploaded. Please check your network and try again.',
+                UPLOAD_ERR_NO_TMP_DIR => 'Missing a temporary upload directory on the server.',
+                UPLOAD_ERR_CANT_WRITE => 'Failed to write image to server disk. Check permissions.',
+                default => 'The image failed to upload (PHP Error: ' . $err . ').',
+            };
+            return redirect()->back()->withInput()->with('error', $msg);
+        }
+
         $data = $request->validate([
             'name' => ['required', 'string', 'max:255'],
             'parent_id' => ['nullable', 'exists:services,id', Rule::notIn([$service->id])],

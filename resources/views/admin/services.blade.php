@@ -824,3 +824,59 @@
     </div>
 </div>
 @endsection
+
+@section('scripts')
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    // Auto-compress large service images on client-side before submission
+    // Guarantees uploads never exceed cPanel's 2MB limit and upload instantaneously
+    document.addEventListener('change', function(e) {
+        if (e.target && e.target.type === 'file' && e.target.name === 'image') {
+            const input = e.target;
+            const file = input.files && input.files[0];
+            if (!file || !file.type.startsWith('image/') || file.type === 'image/svg+xml') return;
+
+            // If file is > 800KB, downscale and compress to crisp ~300KB
+            if (file.size > 800000) {
+                const reader = new FileReader();
+                reader.onload = function(evt) {
+                    const img = new Image();
+                    img.onload = function() {
+                        const canvas = document.createElement('canvas');
+                        let width = img.width;
+                        let height = img.height;
+                        const maxDim = 1600;
+
+                        if (width > maxDim || height > maxDim) {
+                            if (width > height) {
+                                height = Math.round((height * maxDim) / width);
+                                width = maxDim;
+                            } else {
+                                width = Math.round((width * maxDim) / height);
+                                height = maxDim;
+                            }
+                        }
+
+                        canvas.width = width;
+                        canvas.height = height;
+                        const ctx = canvas.getContext('2d');
+                        ctx.drawImage(img, 0, 0, width, height);
+
+                        canvas.toBlob(function(blob) {
+                            if (blob && window.DataTransfer) {
+                                const dt = new DataTransfer();
+                                const newFile = new File([blob], file.name.replace(/\.[^.]+$/, '.jpg'), { type: 'image/jpeg', lastModified: Date.now() });
+                                dt.items.add(newFile);
+                                input.files = dt.files;
+                            }
+                        }, 'image/jpeg', 0.85);
+                    };
+                    img.src = evt.target.result;
+                };
+                reader.readAsDataURL(file);
+            }
+        }
+    });
+});
+</script>
+@endsection
