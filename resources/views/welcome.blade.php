@@ -1383,9 +1383,11 @@
 
                         // Sub-services JSON for modal (only include price if logged in, in USD)
                         $subServicesData = $service->subServices->map(fn($sub) => [
+                            'id' => $sub->id,
                             'name' => $sub->name,
                             'price' => Auth::check() ? ($sub->price ?? null) : null,
                             'icon' => $sub->icon ?? 'bi-check-circle',
+                            'book_url' => Auth::check() ? route('client.book', $sub->id) : route('login'),
                         ])->toJson();
 
                         $hasCustomImage = !empty($service->image_url) && (
@@ -1995,7 +1997,11 @@
         if (count > 0) {
             subServices.forEach(function(sub) {
                 var item = document.createElement('a');
-                item.href = '{{ Auth::check() ? route("client.book") : route("login") }}';
+                @auth
+                    item.href = sub.book_url || (sub.id ? ('{{ url("client/book") }}/' + sub.id) : '{{ route("client.services") }}');
+                @else
+                    item.href = '{{ route("login") }}';
+                @endauth
                 item.className = 'ios-sub-item';
                 
                 var priceHtml = '';
